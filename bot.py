@@ -600,6 +600,13 @@ async def on_message(message: discord.Message):
 async def on_ready():
     log.info("Logged in as %s (%s)", bot.user, bot.user.id)
 
+    if seerr is None:
+        log.warning("Seerr is NOT configured (OVERSEERR_URL / OVERSEERR_API_KEY "
+                    "missing from .env) — media requests are disabled!")
+    if not REQUESTS_CHANNEL_ID:
+        log.warning("REQUESTS_CHANNEL_ID missing from .env — typed requests and "
+                    "the requests embed are disabled.")
+
     invite_channel = bot.get_channel(CHANNEL_ID) if CHANNEL_ID else None
     if invite_channel is None:
         for g in bot.guilds:
