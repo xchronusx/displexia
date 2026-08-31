@@ -51,6 +51,7 @@ bash /opt/displexia/update.sh     # git pull + deps + restart
 | `GUILD_ID` / `CHANNEL_ID` / `REQUESTS_CHANNEL_ID` | Your server, invite channel, and requests channel IDs (enable Developer Mode, right-click → Copy ID) |
 | `PLEX_URL` / `PLEX_TOKEN` | Plex server URL (e.g. `http://192.168.1.10:32400`) + account token (`setup.sh` can fetch it via plex.tv/link) |
 | `OVERSEERR_URL` / `OVERSEERR_API_KEY` | Seerr base URL (e.g. `http://192.168.1.11:5055`) + API key (Seerr → Settings → General) |
+| `MOVIES_CHANNEL` / `TV_CHANNEL` | Where announcement cards go, per type — channel name (`movies`, `tv`) or ID; empty = the requests channel |
 | `SERVER_NAME` | Branding shown in embeds/commands, e.g. `yourdomain.com` (empty = plain "Plex") |
 | `ROLE_NAME` | Role granted on successful invite (default `plex members`) |
 | `REQUESTS_ROLE_NAME` | Role required to request (empty = anyone) |

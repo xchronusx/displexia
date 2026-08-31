@@ -38,6 +38,12 @@ OVERSEERR_URL = os.environ.get("OVERSEERR_URL", "").strip()
 OVERSEERR_API_KEY = os.environ.get("OVERSEERR_API_KEY", "").strip()
 SERVER_NAME = os.environ.get("SERVER_NAME", "").strip()
 PLEX_NAME = f"{SERVER_NAME} Plex".strip()  # "yourdomain.com Plex" or just "Plex"
+# Per-type announcement channels (name like "tv"/"movies" or a channel ID);
+# empty = announce in the requests channel.
+ANNOUNCE_CHANNEL = {
+    "movie": os.environ.get("MOVIES_CHANNEL", "").strip().lstrip("#"),
+    "tv": os.environ.get("TV_CHANNEL", "").strip().lstrip("#"),
+}
 SETUP_TEST = os.environ.get("SETUP_TEST") == "1"
 
 STATE_FILE = BASE_DIR / "state.json"
@@ -406,6 +412,23 @@ class ResultsView(discord.ui.View):
                             interaction.user, interaction.user.id)
 
 
+def announce_channel_for(media_type: str, member, fallback_channel):
+    """Route the announcement card: #movies / #tv if configured, else requests channel."""
+    conf = ANNOUNCE_CHANNEL.get(media_type, "")
+    ch = None
+    if conf:
+        if conf.isdigit():
+            ch = bot.get_channel(int(conf))
+        else:
+            guild = getattr(member, "guild", None)
+            if guild:
+                ch = discord.utils.get(guild.text_channels, name=conf)
+        if ch is None:
+            log.warning("Announce channel %r for %s not found — using the requests channel",
+                        conf, media_type)
+    return ch or bot.get_channel(REQUESTS_CHANNEL_ID) or fallback_channel
+
+
 async def submit_request(member: discord.Member, pick: dict,
                          channel) -> tuple[str, discord.Embed | None]:
     """Returns (result text, info card embed or None)."""
@@ -426,7 +449,7 @@ async def submit_request(member: discord.Member, pick: dict,
     log.info("request: discord=%s (%s) %s %s -> %s", member, member.id,
              pick["media_type"], pick["title"], "ok" if ok else msg)
     if ok:
-        announce_channel = bot.get_channel(REQUESTS_CHANNEL_ID) or channel
+        announce_channel = announce_channel_for(pick["media_type"], member, channel)
         try:
             await announce_channel.send(embed=build_media_embed(
                 pick, footer=f"Requested by {member.display_name} • added to the download queue"))
