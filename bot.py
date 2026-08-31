@@ -1,9 +1,10 @@
-"""displexia — the ztechnus.com Plex Discord bot.
+"""displexia — Plex Discord bot: library invites + Seerr media requests.
 
 #join-plex        → Plex library invites (button/modal, typed email, /plexinvite)
 #media-requests   → movie & TV requests via Seerr (button/modal, typed title, /request)
 
-Successful invitees get the "plex members" role; requests require it.
+Successful invitees get the ROLE_NAME role; requests require REQUESTS_ROLE_NAME.
+Branding comes from SERVER_NAME in .env — nothing server-specific is hardcoded.
 """
 
 import asyncio
@@ -35,6 +36,8 @@ REQUESTS_ROLE_NAME = os.environ.get("REQUESTS_ROLE_NAME", "").strip()
 LIBRARIES = os.environ.get("LIBRARIES", "all").strip()
 OVERSEERR_URL = os.environ.get("OVERSEERR_URL", "").strip()
 OVERSEERR_API_KEY = os.environ.get("OVERSEERR_API_KEY", "").strip()
+SERVER_NAME = os.environ.get("SERVER_NAME", "").strip()
+PLEX_NAME = f"{SERVER_NAME} Plex".strip()  # "yourdomain.com Plex" or just "Plex"
 SETUP_TEST = os.environ.get("SETUP_TEST") == "1"
 
 STATE_FILE = BASE_DIR / "state.json"
@@ -252,7 +255,7 @@ class InviteView(discord.ui.View):
         await interaction.response.send_modal(EmailModal())
 
 
-@bot.tree.command(name="plexinvite", description="Get invited to the ztechnus.com Plex server")
+@bot.tree.command(name="plexinvite", description=f"Get invited to the {PLEX_NAME} server")
 @app_commands.describe(email="The email address of your Plex account")
 async def plexinvite(interaction: discord.Interaction, email: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -314,13 +317,20 @@ def build_options(results: list[dict]) -> list[discord.SelectOption]:
 
 
 class ResultsView(discord.ui.View):
-    """Select menu of search results, locked to the requester."""
+    """Select menu of search results, locked to the requester.
 
-    def __init__(self, requester_id: int, results: list[dict], public_message: discord.Message | None = None):
+    Everything stays hidden until the request is actually sent: menus are
+    ephemeral (button/slash) or self-destruct (typed flow), results go
+    privately to the requester, and the only public trace is the
+    announcement posted after Seerr accepts the request.
+    """
+
+    def __init__(self, requester_id: int, results: list[dict], public: bool = False):
         super().__init__(timeout=180)
         self.requester_id = requester_id
+        self.public = public                 # True = menu is a normal channel message
+        self.menu_message = None             # set by the caller after sending the menu
         self.results = {f"{r['media_type']}:{r['tmdb_id']}:{i}": r for i, r in enumerate(results)}
-        self.public_message = public_message
         select = discord.ui.Select(placeholder="Pick the title you want…",
                                    options=build_options(results))
         select.callback = self.on_pick
@@ -328,29 +338,51 @@ class ResultsView(discord.ui.View):
         self.add_item(select)
 
     async def on_timeout(self):
-        if self.public_message:
-            try:
-                await self.public_message.edit(view=None)
-            except discord.HTTPException:
-                pass
+        if self.menu_message is None:
+            return
+        try:
+            if self.public:
+                await self.menu_message.delete()   # leave no trace in the channel
+            else:
+                await self.menu_message.edit(
+                    content="⌛ Search expired — start a new search.", view=None)
+        except discord.HTTPException:
+            pass
 
     async def on_pick(self, interaction: discord.Interaction):
         if interaction.user.id != self.requester_id:
             await interaction.response.send_message(
-                "That menu belongs to someone else — type a title to start your own search.",
+                "That menu belongs to someone else — start your own search.",
                 ephemeral=True)
             return
         pick = self.results[self.select.values[0]]
-        await interaction.response.defer()
+        self.stop()
+
+        if self.public:
+            # Typed flow: acknowledge privately, then remove the menu from the channel.
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            menu = self.menu_message or interaction.message
+            if menu is not None:
+                try:
+                    await menu.delete()
+                except discord.HTTPException:
+                    pass
+        else:
+            # Ephemeral menu: swap it for a progress note. This UPDATE_MESSAGE
+            # response also makes the menu the interaction's original response,
+            # so the edit below reliably lands on it.
+            await interaction.response.edit_message(
+                content=f"⏳ Requesting **{pick['title']}**…", view=None)
+
         text = await submit_request(interaction.user, pick, interaction.channel)
-        self.select.disabled = True
         try:
             await interaction.edit_original_response(content=text, view=None)
         except discord.HTTPException:
-            # message may be non-ephemeral (typed flow)
-            if self.public_message:
-                await self.public_message.edit(content=text, view=None)
-        self.stop()
+            try:
+                await interaction.followup.send(text, ephemeral=True)
+            except discord.HTTPException:
+                log.warning("Could not deliver request result to %s (%s)",
+                            interaction.user, interaction.user.id)
 
 
 async def submit_request(member: discord.Member, pick: dict, channel) -> str:
@@ -362,7 +394,11 @@ async def submit_request(member: discord.Member, pick: dict, channel) -> str:
     if pick["status"] in (2, 3):
         return f"⏳ {label} was already requested — it's in the queue."
 
-    ok, msg = await seerr.request(pick["media_type"], pick["tmdb_id"])
+    try:
+        ok, msg = await seerr.request(pick["media_type"], pick["tmdb_id"])
+    except Exception as e:
+        log.exception("Seerr request errored for %s %s", pick["media_type"], pick["tmdb_id"])
+        return f"❌ Couldn't reach Seerr: {str(e)[:150] or type(e).__name__}"
     log.info("request: discord=%s (%s) %s %s -> %s", member, member.id,
              pick["media_type"], pick["title"], "ok" if ok else msg)
     if ok:
@@ -411,9 +447,10 @@ class RequestModal(discord.ui.Modal, title="Request a movie or show"):
         if err:
             await interaction.followup.send(err, ephemeral=True)
             return
-        await interaction.followup.send(
+        view = ResultsView(interaction.user.id, results)
+        view.menu_message = await interaction.followup.send(
             f"🔍 Results for **{self.query.value}** — pick one:",
-            view=ResultsView(interaction.user.id, results), ephemeral=True)
+            view=view, ephemeral=True)
 
 
 class RequestButtonView(discord.ui.View):
@@ -437,26 +474,35 @@ async def request_cmd(interaction: discord.Interaction, title: str):
     if err:
         await interaction.followup.send(err, ephemeral=True)
         return
-    await interaction.followup.send(
-        f"🔍 Results for **{title}** — pick one:",
-        view=ResultsView(interaction.user.id, results), ephemeral=True)
+    view = ResultsView(interaction.user.id, results)
+    view.menu_message = await interaction.followup.send(
+        f"🔍 Results for **{title}** — pick one:", view=view, ephemeral=True)
 
 
 async def handle_request_message(message: discord.Message):
     content = (message.content or "").strip()
     if not content or content.startswith("/") or EMAIL_RE.search(content):
         return
+    # Keep the channel clean: the typed title disappears, the menu self-destructs,
+    # and only the post-request announcement is ever left behind.
+    try:
+        await message.delete()
+    except discord.HTTPException:
+        pass
     err, results = await start_request_search(message.author, content)
     if err:
         try:
-            await message.reply(err, delete_after=30, mention_author=True)
+            await message.channel.send(f"{message.author.mention} {err}", delete_after=20)
         except discord.Forbidden:
             pass
         return
-    reply = await message.reply(f"🔍 Results for **{content}** — pick one:",
-                                mention_author=True)
-    view = ResultsView(message.author.id, results, public_message=reply)
-    await reply.edit(view=view)
+    view = ResultsView(message.author.id, results, public=True)
+    try:
+        view.menu_message = await message.channel.send(
+            f"🔍 {message.author.mention} — results for **{content}**, pick one "
+            f"(this menu vanishes once the request is sent):", view=view)
+    except discord.Forbidden:
+        log.error("Cannot post the results menu in #%s", message.channel)
 
 
 # ---------------------------------------------------------------- channel embeds
@@ -475,10 +521,10 @@ def save_state(state: dict):
 
 def build_invite_embed() -> discord.Embed:
     e = discord.Embed(
-        title="🎬  ztechnus.com Plex — get access",
+        title=f"🎬  {PLEX_NAME} — get access",
         colour=discord.Colour.from_str("#e5a00d"),
         description=(
-            "Movies, TV shows and music, streamed from the ztechnus.com server.\n\n"
+            f"Movies, TV shows and music, streamed from {PLEX_NAME}.\n\n"
             "**Three ways to get your invite:**\n"
             "🎟️ Click **Get Plex Access** below and enter your Plex email\n"
             "⌨️ Just type your email in this channel (I'll delete it right away)\n"
@@ -502,10 +548,11 @@ def build_request_embed() -> discord.Embed:
             "download queue.\n\n"
             "**Three ways to request:**\n"
             "🔎 Click **Search & Request** below\n"
-            "⌨️ Just type the title in this channel (e.g. `Dune Part Two`)\n"
+            "⌨️ Just type the title in this channel (e.g. `Dune Part Two`) — "
+            "I'll tidy your message away\n"
             "🎯 Use `/request title:...`\n\n"
-            "Pick the right match from the list I show you, and I'll tell you if "
-            "it's already on Plex or on its way."
+            "Searching and picking happens privately — nothing shows up here "
+            "until your request is actually sent."
         ),
     )
     if REQUESTS_ROLE_NAME:

@@ -1,6 +1,10 @@
 """Tiny async client for the Overseerr/Jellyseerr/Seerr API."""
 
+import logging
+
 import aiohttp
+
+log = logging.getLogger("displexia.seerr")
 
 # Overseerr media status codes
 STATUS_LABEL = {
@@ -21,7 +25,7 @@ class SeerrClient:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 headers={"X-Api-Key": self.api_key, "Accept": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=20),
+                timeout=aiohttp.ClientTimeout(total=30),
             )
         return self._session
 
@@ -32,7 +36,8 @@ class SeerrClient:
     async def search(self, query: str, limit: int = 8) -> list[dict]:
         """Returns simplified results: title, year, media_type, tmdb_id, status."""
         s = await self._sess()
-        async with s.get(f"{self.base}/api/v1/search", params={"query": query, "page": 1}) as r:
+        async with s.get(f"{self.base}/api/v1/search",
+                         params={"query": query, "page": "1"}) as r:
             r.raise_for_status()
             data = await r.json()
         out = []
@@ -56,24 +61,39 @@ class SeerrClient:
 
     async def request(self, media_type: str, tmdb_id: int) -> tuple[bool, str]:
         """Submit a request. Returns (ok, message)."""
-        s = await self._sess()
-        payload: dict = {"mediaType": media_type, "mediaId": tmdb_id}
+        payload: dict = {"mediaType": media_type, "mediaId": int(tmdb_id)}
         if media_type == "tv":
-            payload["seasons"] = "all"
+            # Explicit season list works on every Overseerr/Jellyseerr version;
+            # "all" is the fallback if the season lookup fails.
+            seasons = await self._season_numbers(tmdb_id)
+            payload["seasons"] = seasons or "all"
+
+        status, body = await self._post_request(payload)
+        if status in (200, 201):
+            return (True, "requested")
+
+        if media_type == "tv":
+            # Retry once with the other seasons form (API differences between versions)
+            alt = "all" if isinstance(payload["seasons"], list) \
+                else await self._season_numbers(tmdb_id)
+            if alt and alt != payload["seasons"]:
+                payload["seasons"] = alt
+                status, body = await self._post_request(payload)
+                if status in (200, 201):
+                    return (True, "requested")
+
+        log.warning("Seerr request failed: %s %s -> HTTP %s: %s",
+                    media_type, tmdb_id, status, body)
+        if status == 409:
+            return (False, "already exists")
+        return (False, f"{body} (HTTP {status})")
+
+    async def _post_request(self, payload: dict) -> tuple[int, str]:
+        s = await self._sess()
         async with s.post(f"{self.base}/api/v1/request", json=payload) as r:
             if r.status in (200, 201):
-                return (True, "requested")
-            body = await self._safe_message(r)
-            # Some versions want an explicit season list for TV
-            if media_type == "tv" and r.status in (400, 500):
-                seasons = await self._season_numbers(tmdb_id)
-                if seasons:
-                    payload["seasons"] = seasons
-                    async with s.post(f"{self.base}/api/v1/request", json=payload) as r2:
-                        if r2.status in (200, 201):
-                            return (True, "requested")
-                        body = await self._safe_message(r2)
-            return (False, body)
+                return (r.status, "")
+            return (r.status, await self._safe_message(r))
 
     async def _season_numbers(self, tmdb_id: int) -> list[int]:
         try:

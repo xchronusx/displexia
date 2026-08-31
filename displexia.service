@@ -1,5 +1,5 @@
 [Unit]
-Description=displexia — ztechnus.com Plex Discord bot (invites + requests)
+Description=displexia — Plex Discord bot (invites + requests)
 After=network-online.target
 Wants=network-online.target
 
