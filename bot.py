@@ -17,6 +17,7 @@ from pathlib import Path
 
 import discord
 from discord import app_commands
+from discord.ext import tasks
 from dotenv import load_dotenv
 
 from seerr import SeerrClient, STATUS_LABEL
@@ -44,6 +45,12 @@ ANNOUNCE_CHANNEL = {
     "movie": os.environ.get("MOVIES_CHANNEL", "").strip().lstrip("#"),
     "tv": os.environ.get("TV_CHANNEL", "").strip().lstrip("#"),
 }
+# Shown when a request becomes watchable, e.g. "plex.yourdomain.com"
+PLEX_LINK = os.environ.get("PLEX_LINK", "").strip()
+AVAILABLE_TEXT = f"Available to watch on {PLEX_LINK} now" if PLEX_LINK \
+    else "Available to watch on Plex now"
+AVAILABLE_COLOUR = "#2ecc71"   # cards flip from Plex gold to green when watchable
+WATCH_MAX_AGE = 30 * 86400     # stop polling a request after 30 days
 SETUP_TEST = os.environ.get("SETUP_TEST") == "1"
 
 STATE_FILE = BASE_DIR / "state.json"
@@ -442,7 +449,7 @@ async def submit_request(member: discord.Member, pick: dict,
         return (f"⏳ {label} was already requested — it's in the queue.", card)
 
     try:
-        ok, msg = await seerr.request(pick["media_type"], pick["tmdb_id"])
+        ok, msg, media_id = await seerr.request(pick["media_type"], pick["tmdb_id"])
     except Exception as e:
         log.exception("Seerr request errored for %s %s", pick["media_type"], pick["tmdb_id"])
         return (f"❌ Couldn't reach Seerr: {str(e)[:150] or type(e).__name__}", None)
@@ -451,8 +458,11 @@ async def submit_request(member: discord.Member, pick: dict,
     if ok:
         announce_channel = announce_channel_for(pick["media_type"], member, channel)
         try:
-            await announce_channel.send(embed=build_media_embed(
+            ann = await announce_channel.send(embed=build_media_embed(
                 pick, footer=f"Requested by {member.display_name} • added to the download queue"))
+            if media_id and ann:
+                add_watch(media_id, getattr(announce_channel, "id", 0), ann.id,
+                          member.display_name)
         except discord.Forbidden:
             pass
         if getattr(announce_channel, "id", None) == REQUESTS_CHANNEL_ID:
@@ -464,6 +474,72 @@ async def submit_request(member: discord.Member, pick: dict,
     if "already exists" in low or "already" in low:
         return (f"⏳ {label} was already requested — it's in the queue.", card)
     return (f"❌ Couldn't request {label}: {msg}", card)
+
+
+# --- availability watcher: flip announcement cards to green once watchable ---
+
+def add_watch(media_id: int, channel_id: int, message_id: int, requester: str):
+    state = load_state()
+    state.setdefault("watches", []).append({
+        "media_id": media_id, "channel_id": channel_id,
+        "message_id": message_id, "requester": requester, "added": time.time(),
+    })
+    save_state(state)
+    log.info("watching seerr media %s for availability (msg %s)", media_id, message_id)
+
+
+async def mark_available(watch: dict) -> bool:
+    """Edit the announcement card: green + 'Available to watch' footer."""
+    channel = bot.get_channel(watch["channel_id"])
+    if channel is None:
+        return True                       # channel gone — stop watching
+    try:
+        msg = await channel.fetch_message(watch["message_id"])
+    except discord.HTTPException:
+        return True                       # message deleted — stop watching
+    if not msg.embeds:
+        return True
+    e = msg.embeds[0]
+    e.colour = discord.Colour.from_str(AVAILABLE_COLOUR)
+    e.set_footer(text=f"Requested by {watch['requester']} • {AVAILABLE_TEXT}")
+    try:
+        await msg.edit(embed=e)
+        log.info("marked available: msg %s (%s)", msg.id, e.title)
+    except discord.HTTPException:
+        pass
+    return True
+
+
+async def check_watches():
+    watches = load_state().get("watches", [])
+    if not watches or seerr is None:
+        return
+    drop: set[int] = set()
+    for w in watches:
+        try:
+            status = await seerr.media_status(w["media_id"])
+        except Exception:
+            continue                      # Seerr unreachable — try again next cycle
+        if status in (4, 5):              # partially or fully available
+            await mark_available(w)
+            drop.add(w["message_id"])
+        elif time.time() - w.get("added", 0) > WATCH_MAX_AGE:
+            drop.add(w["message_id"])     # stale — give up quietly
+    if drop:
+        state = load_state()
+        state["watches"] = [w for w in state.get("watches", [])
+                            if w["message_id"] not in drop]
+        save_state(state)
+
+
+@tasks.loop(minutes=5)
+async def watch_available():
+    await check_watches()
+
+
+@watch_available.before_loop
+async def _wait_ready():
+    await bot.wait_until_ready()
 
 
 async def start_request_search(member: discord.Member, query: str):
@@ -683,6 +759,8 @@ async def on_ready():
     if not REQUESTS_CHANNEL_ID:
         log.warning("REQUESTS_CHANNEL_ID missing from .env — typed requests and "
                     "the requests embed are disabled.")
+    if seerr is not None and not watch_available.is_running():
+        watch_available.start()
 
     invite_channel = bot.get_channel(CHANNEL_ID) if CHANNEL_ID else None
     if invite_channel is None:

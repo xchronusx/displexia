@@ -17,6 +17,7 @@ Discord bot for a Plex stack: automatic library invites + media requests, wired 
 - 🔎 **Search & Request** button, ⌨️ typing a title in the channel, or 🎯 `/request title:...`
 - Searching and picking is fully private: typed titles are deleted, result menus are ephemeral or self-destruct, and nothing appears in the channel until the request is actually sent — then one announcement is posted
 - Results and announcements are rich info cards: poster artwork, title, year, and description
+- When a request finishes downloading, its announcement card turns green and flips to "Available to watch on `PLEX_LINK` now" (polled from Seerr every 5 min)
 - The button embeds re-post themselves so they always stay at the bottom of their channel
 - Requests go to Seerr, which routes movies→Radarr / TV→Sonarr with your profiles
 - Knows what's already on Plex or already queued, and says so instead of double-requesting
@@ -52,6 +53,7 @@ bash /opt/displexia/update.sh     # git pull + deps + restart
 | `PLEX_URL` / `PLEX_TOKEN` | Plex server URL (e.g. `http://192.168.1.10:32400`) + account token (`setup.sh` can fetch it via plex.tv/link) |
 | `OVERSEERR_URL` / `OVERSEERR_API_KEY` | Seerr base URL (e.g. `http://192.168.1.11:5055`) + API key (Seerr → Settings → General) |
 | `MOVIES_CHANNEL` / `TV_CHANNEL` | Where announcement cards go, per type — channel name (`movies`, `tv`) or ID; empty = the requests channel |
+| `PLEX_LINK` | Shown on green "available" cards, e.g. `plex.yourdomain.com` (empty = "Plex") |
 | `SERVER_NAME` | Branding shown in embeds/commands, e.g. `yourdomain.com` (empty = plain "Plex") |
 | `ROLE_NAME` | Role granted on successful invite (default `plex members`) |
 | `REQUESTS_ROLE_NAME` | Role required to request (empty = anyone) |

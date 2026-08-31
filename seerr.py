@@ -65,8 +65,8 @@ class SeerrClient:
                 break
         return out
 
-    async def request(self, media_type: str, tmdb_id: int) -> tuple[bool, str]:
-        """Submit a request. Returns (ok, message)."""
+    async def request(self, media_type: str, tmdb_id: int) -> tuple[bool, str, int | None]:
+        """Submit a request. Returns (ok, message, seerr_media_id)."""
         payload: dict = {"mediaType": media_type, "mediaId": int(tmdb_id)}
         if media_type == "tv":
             # Explicit season list works on every Overseerr/Jellyseerr version;
@@ -74,9 +74,9 @@ class SeerrClient:
             seasons = await self._season_numbers(tmdb_id)
             payload["seasons"] = seasons or "all"
 
-        status, body = await self._post_request(payload)
+        status, data, body = await self._post_request(payload)
         if status in (200, 201):
-            return (True, "requested")
+            return (True, "requested", (data.get("media") or {}).get("id"))
 
         if media_type == "tv":
             # Retry once with the other seasons form (API differences between versions)
@@ -84,22 +84,35 @@ class SeerrClient:
                 else await self._season_numbers(tmdb_id)
             if alt and alt != payload["seasons"]:
                 payload["seasons"] = alt
-                status, body = await self._post_request(payload)
+                status, data, body = await self._post_request(payload)
                 if status in (200, 201):
-                    return (True, "requested")
+                    return (True, "requested", (data.get("media") or {}).get("id"))
 
         log.warning("Seerr request failed: %s %s -> HTTP %s: %s",
                     media_type, tmdb_id, status, body)
         if status == 409:
-            return (False, "already exists")
-        return (False, f"{body} (HTTP {status})")
+            return (False, "already exists", None)
+        return (False, f"{body} (HTTP {status})", None)
 
-    async def _post_request(self, payload: dict) -> tuple[int, str]:
+    async def media_status(self, media_id: int) -> int | None:
+        """Current status of a Seerr media item (see STATUS_LABEL); None on error."""
+        s = await self._sess()
+        async with s.get(f"{self.base}/api/v1/media/{media_id}") as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+            return data.get("status")
+
+    async def _post_request(self, payload: dict) -> tuple[int, dict, str]:
         s = await self._sess()
         async with s.post(f"{self.base}/api/v1/request", json=payload) as r:
             if r.status in (200, 201):
-                return (r.status, "")
-            return (r.status, await self._safe_message(r))
+                try:
+                    data = await r.json()
+                except Exception:
+                    data = {}
+                return (r.status, data or {}, "")
+            return (r.status, {}, await self._safe_message(r))
 
     async def _season_numbers(self, tmdb_id: int) -> list[int]:
         try:
