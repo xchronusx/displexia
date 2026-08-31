@@ -48,12 +48,18 @@ class SeerrClient:
             title = item.get("title") or item.get("name") or "?"
             date = item.get("releaseDate") or item.get("firstAirDate") or ""
             media_info = item.get("mediaInfo") or {}
+            poster = item.get("posterPath")
+            overview = (item.get("overview") or "").strip()
+            if len(overview) > 350:
+                overview = overview[:347].rstrip() + "…"
             out.append({
                 "tmdb_id": item.get("id"),
                 "media_type": mtype,
                 "title": title,
                 "year": date[:4] if date else "",
                 "status": media_info.get("status") or 1,
+                "poster": f"https://image.tmdb.org/t/p/w342{poster}" if poster else None,
+                "overview": overview,
             })
             if len(out) >= limit:
                 break

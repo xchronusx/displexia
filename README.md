@@ -16,6 +16,8 @@ Discord bot for a Plex stack: automatic library invites + media requests, wired 
 
 - 🔎 **Search & Request** button, ⌨️ typing a title in the channel, or 🎯 `/request title:...`
 - Searching and picking is fully private: typed titles are deleted, result menus are ephemeral or self-destruct, and nothing appears in the channel until the request is actually sent — then one announcement is posted
+- Results and announcements are rich info cards: poster artwork, title, year, and description
+- The button embeds re-post themselves so they always stay at the bottom of their channel
 - Requests go to Seerr, which routes movies→Radarr / TV→Sonarr with your profiles
 - Knows what's already on Plex or already queued, and says so instead of double-requesting
 

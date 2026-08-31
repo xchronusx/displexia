@@ -295,12 +295,29 @@ async def handle_invite_message(message: discord.Message):
         await message.channel.send(f"{message.author.mention} {note} {summary}", delete_after=45)
     except discord.Forbidden:
         pass
+    await restick(message.channel, "invite_message_id", build_invite_embed(), InviteView())
 
 
 # ---------------------------------------------------------------- request flows
 
 TYPE_EMOJI = {"movie": "🎬", "tv": "📺"}
 TYPE_LABEL = {"movie": "Movie", "tv": "TV Show"}
+TYPE_COLOUR = {"movie": "#e5a00d", "tv": "#5865f2"}
+
+
+def build_media_embed(pick: dict, footer: str | None = None) -> discord.Embed:
+    """Info card for a search pick: artwork, title, year, description."""
+    title = f"{pick['title']} ({pick['year']})" if pick["year"] else pick["title"]
+    e = discord.Embed(
+        title=f"{TYPE_EMOJI[pick['media_type']]}  {title}",
+        colour=discord.Colour.from_str(TYPE_COLOUR[pick["media_type"]]),
+        description=pick.get("overview") or "No description available.",
+    )
+    if pick.get("poster"):
+        e.set_thumbnail(url=pick["poster"])
+    if footer:
+        e.set_footer(text=footer)
+    return e
 
 
 def build_options(results: list[dict]) -> list[discord.SelectOption]:
@@ -377,46 +394,53 @@ class ResultsView(discord.ui.View):
             await interaction.response.edit_message(
                 content=f"⏳ Requesting **{pick['title']}**…", view=None)
 
-        text = await submit_request(interaction.user, pick, interaction.channel)
+        text, card = await submit_request(interaction.user, pick, interaction.channel)
         try:
-            await interaction.edit_original_response(content=text, view=None)
+            await interaction.edit_original_response(content=text, embed=card, view=None)
         except discord.HTTPException:
             try:
-                await interaction.followup.send(text, ephemeral=True)
+                await interaction.followup.send(
+                    text, embed=card or discord.utils.MISSING, ephemeral=True)
             except discord.HTTPException:
                 log.warning("Could not deliver request result to %s (%s)",
                             interaction.user, interaction.user.id)
 
 
-async def submit_request(member: discord.Member, pick: dict, channel) -> str:
+async def submit_request(member: discord.Member, pick: dict,
+                         channel) -> tuple[str, discord.Embed | None]:
+    """Returns (result text, info card embed or None)."""
     label = f"**{pick['title']} ({pick['year']})**" if pick["year"] else f"**{pick['title']}**"
     emoji = TYPE_EMOJI[pick["media_type"]]
+    card = build_media_embed(pick)
 
     if pick["status"] == 5:
-        return f"✅ {label} is already on Plex — go watch it!"
+        return (f"✅ {label} is already on Plex — go watch it!", card)
     if pick["status"] in (2, 3):
-        return f"⏳ {label} was already requested — it's in the queue."
+        return (f"⏳ {label} was already requested — it's in the queue.", card)
 
     try:
         ok, msg = await seerr.request(pick["media_type"], pick["tmdb_id"])
     except Exception as e:
         log.exception("Seerr request errored for %s %s", pick["media_type"], pick["tmdb_id"])
-        return f"❌ Couldn't reach Seerr: {str(e)[:150] or type(e).__name__}"
+        return (f"❌ Couldn't reach Seerr: {str(e)[:150] or type(e).__name__}", None)
     log.info("request: discord=%s (%s) %s %s -> %s", member, member.id,
              pick["media_type"], pick["title"], "ok" if ok else msg)
     if ok:
         announce_channel = bot.get_channel(REQUESTS_CHANNEL_ID) or channel
         try:
-            await announce_channel.send(
-                f"{emoji} **{member.display_name}** requested {label} — added to the download queue.")
+            await announce_channel.send(embed=build_media_embed(
+                pick, footer=f"Requested by {member.display_name} • added to the download queue"))
         except discord.Forbidden:
             pass
+        if getattr(announce_channel, "id", None) == REQUESTS_CHANNEL_ID:
+            await restick(announce_channel, "request_message_id",
+                          build_request_embed(), RequestButtonView())
         return (f"{emoji} {label} requested! Seerr sent it to the right place — "
-                f"it'll appear on Plex once it's downloaded.")
+                f"it'll appear on Plex once it's downloaded.", card)
     low = (msg or "").lower()
     if "already exists" in low or "already" in low:
-        return f"⏳ {label} was already requested — it's in the queue."
-    return f"❌ Couldn't request {label}: {msg}"
+        return (f"⏳ {label} was already requested — it's in the queue.", card)
+    return (f"❌ Couldn't request {label}: {msg}", card)
 
 
 async def start_request_search(member: discord.Member, query: str):
@@ -501,14 +525,16 @@ async def handle_request_message(message: discord.Message):
             await message.channel.send(f"{message.author.mention} {err}", delete_after=20)
         except discord.Forbidden:
             pass
-        return
-    view = ResultsView(message.author.id, results, public=True)
-    try:
-        view.menu_message = await message.channel.send(
-            f"🔍 {message.author.mention} — results for **{content}**, pick one "
-            f"(this menu vanishes once the request is sent):", view=view)
-    except discord.Forbidden:
-        log.error("Cannot post the results menu in #%s", message.channel)
+    else:
+        view = ResultsView(message.author.id, results, public=True)
+        try:
+            view.menu_message = await message.channel.send(
+                f"🔍 {message.author.mention} — results for **{content}**, pick one "
+                f"(this menu vanishes once the request is sent):", view=view)
+        except discord.Forbidden:
+            log.error("Cannot post the results menu in #%s", message.channel)
+    await restick(message.channel, "request_message_id",
+                  build_request_embed(), RequestButtonView())
 
 
 # ---------------------------------------------------------------- channel embeds
@@ -564,6 +590,34 @@ def build_request_embed() -> discord.Embed:
     if REQUESTS_ROLE_NAME:
         e.set_footer(text=f"Requires the {REQUESTS_ROLE_NAME} role — get it in #{CHANNEL_NAME}")
     return e
+
+
+_sticky_lock = asyncio.Lock()
+
+
+async def restick(channel: discord.TextChannel, state_key: str,
+                  embed: discord.Embed, view: discord.ui.View):
+    """Keep the button embed pinned to the bottom: if anything was posted after
+    it, delete it and re-post it as the newest message."""
+    async with _sticky_lock:
+        state = load_state()
+        old_id = state.get(state_key)
+        if old_id and channel.last_message_id == old_id:
+            return
+        if old_id:
+            try:
+                old = await channel.fetch_message(old_id)
+                await old.delete()
+            except discord.HTTPException:
+                pass
+        try:
+            msg = await channel.send(embed=embed, view=view)
+        except discord.Forbidden:
+            log.error("Cannot re-post the button embed in #%s", channel)
+            return
+        state = load_state()
+        state[state_key] = msg.id
+        save_state(state)
 
 
 async def ensure_channel_message(channel: discord.TextChannel, state_key: str,
