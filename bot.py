@@ -197,8 +197,11 @@ async def grant_role(member: discord.Member) -> str:
 def requests_role_ok(member: discord.Member) -> bool:
     if not REQUESTS_ROLE_NAME:
         return True
-    return isinstance(member, discord.Member) and \
-        discord.utils.get(member.roles, name=REQUESTS_ROLE_NAME) is not None
+    if not isinstance(member, discord.Member):
+        return False
+    if member.guild_permissions.administrator:
+        return True  # admins are never locked out of requests
+    return discord.utils.get(member.roles, name=REQUESTS_ROLE_NAME) is not None
 
 
 def requests_role_denial() -> str:
@@ -421,8 +424,10 @@ async def start_request_search(member: discord.Member, query: str):
     if seerr is None:
         return ("❌ Requests aren't configured yet (missing Seerr settings). Tell the admin.", None)
     if not requests_role_ok(member):
+        log.info("search denied (missing %r role): %s (%s)", REQUESTS_ROLE_NAME, member, member.id)
         return (requests_role_denial(), None)
     if not check_cooldown(bot.request_cd, member.id, limit=5):
+        log.info("search rate-limited: %s (%s)", member, member.id)
         return ("⏳ Too many searches — give it a few minutes.", None)
     query = query.strip()
     if not 2 <= len(query) <= 100:
@@ -430,8 +435,9 @@ async def start_request_search(member: discord.Member, query: str):
     try:
         results = await seerr.search(query)
     except Exception as e:
-        log.exception("Seerr search failed")
+        log.exception("Seerr search failed for %r", query)
         return (f"❌ Seerr search failed: {str(e)[:150]}", None)
+    log.info("search: %s (%s) %r -> %d results", member, member.id, query, len(results))
     if not results:
         return (f"🔍 No movies or shows found for **{query}** — check the spelling?", None)
     return (None, results)
