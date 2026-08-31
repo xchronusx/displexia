@@ -1,0 +1,9 @@
+# secrets + runtime state — never commit
+.env
+state.json
+.env.migrated
+
+# python
+__pycache__/
+*.pyc
+venv/

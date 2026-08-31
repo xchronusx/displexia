@@ -1,0 +1,14 @@
+[Unit]
+Description=displexia — ztechnus.com Plex Discord bot (invites + requests)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__DIR__
+ExecStart=__DIR__/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,577 @@
+"""displexia — the ztechnus.com Plex Discord bot.
+
+#join-plex        → Plex library invites (button/modal, typed email, /plexinvite)
+#media-requests   → movie & TV requests via Seerr (button/modal, typed title, /request)
+
+Successful invitees get the "plex members" role; requests require it.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+from pathlib import Path
+
+import discord
+from discord import app_commands
+from dotenv import load_dotenv
+
+from seerr import SeerrClient, STATUS_LABEL
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
+GUILD_ID = int(os.environ.get("GUILD_ID") or 0)
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID") or 0)
+CHANNEL_NAME = os.environ.get("CHANNEL_NAME", "join-plex")
+REQUESTS_CHANNEL_ID = int(os.environ.get("REQUESTS_CHANNEL_ID") or 0)
+PLEX_TOKEN = os.environ.get("PLEX_TOKEN", "").strip()
+PLEX_URL = os.environ.get("PLEX_URL", "").strip()
+ROLE_NAME = os.environ.get("ROLE_NAME", "plex members")
+REQUESTS_ROLE_NAME = os.environ.get("REQUESTS_ROLE_NAME", "").strip()
+LIBRARIES = os.environ.get("LIBRARIES", "all").strip()
+OVERSEERR_URL = os.environ.get("OVERSEERR_URL", "").strip()
+OVERSEERR_API_KEY = os.environ.get("OVERSEERR_API_KEY", "").strip()
+SETUP_TEST = os.environ.get("SETUP_TEST") == "1"
+
+STATE_FILE = BASE_DIR / "state.json"
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("displexia")
+
+seerr = SeerrClient(OVERSEERR_URL, OVERSEERR_API_KEY) if OVERSEERR_URL and OVERSEERR_API_KEY else None
+
+# ---------------------------------------------------------------- Plex invites
+
+_account = None
+_server = None
+
+
+def _connect_account():
+    global _account
+    if _account is None:
+        from plexapi.myplex import MyPlexAccount
+        _account = MyPlexAccount(token=PLEX_TOKEN)
+    return _account
+
+
+def _connect_server():
+    global _server
+    if _server is None:
+        from plexapi.server import PlexServer
+        _server = PlexServer(PLEX_URL, PLEX_TOKEN, timeout=20)
+    return _server
+
+
+def _sections(plex):
+    if LIBRARIES.lower() == "all":
+        return plex.library.sections()
+    wanted = {n.strip().lower() for n in LIBRARIES.split(",") if n.strip()}
+    return [s for s in plex.library.sections() if s.title.lower() in wanted]
+
+
+def invite_email_sync(email: str):
+    """Runs in a worker thread. Returns (status, detail).
+
+    status: sent | pending | updated | error
+    """
+    if not PLEX_TOKEN:
+        return ("error", "Plex is not configured yet (missing PLEX_TOKEN). Tell the server admin.")
+    email_l = email.lower()
+    try:
+        acct = _connect_account()
+        plex = _connect_server()
+        secs = _sections(plex)
+
+        try:
+            for inv in acct.pendingInvites(includeSent=True, includeReceived=False):
+                if (getattr(inv, "email", "") or "").lower() == email_l or \
+                   (getattr(inv, "username", "") or "").lower() == email_l:
+                    return ("pending", "An invite for that address is already waiting — "
+                                       "check your email (including spam) and accept it.")
+        except Exception:
+            pass
+
+        friend = None
+        for u in acct.users():
+            if (u.email or "").lower() == email_l or (u.username or "").lower() == email_l:
+                friend = u
+                break
+        if friend is not None:
+            try:
+                acct.updateFriend(friend, plex, sections=secs)
+                return ("updated", "That account already has access — library share refreshed.")
+            except Exception as e:
+                log.warning("updateFriend failed for %s: %s", email, e)
+                return ("updated", "That account already has access to the server.")
+
+        acct.inviteFriend(email, plex, sections=secs)
+        return ("sent", "Invite sent!")
+    except Exception as e:
+        msg = str(e)
+        low = msg.lower()
+        if "already" in low and ("shar" in low or "invit" in low or "friend" in low or "exist" in low):
+            return ("pending", "Looks like that address was already invited — check your email and accept it.")
+        log.exception("Plex invite failed for %s", email)
+        return ("error", f"Plex said no: {msg[:300]}")
+
+
+# ---------------------------------------------------------------- Discord client
+
+intents = discord.Intents.default()
+intents.message_content = True
+
+
+class Displexia(discord.Client):
+    def __init__(self):
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.invite_cd: dict[int, list[float]] = {}
+        self.request_cd: dict[int, list[float]] = {}
+
+    async def setup_hook(self):
+        self.add_view(InviteView())
+        self.add_view(RequestButtonView())
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+
+    async def close(self):
+        if seerr:
+            await seerr.close()
+        await super().close()
+
+
+bot = Displexia()
+
+
+def check_cooldown(bucket: dict, user_id: int, limit: int = 3, window: int = 600) -> bool:
+    now = time.time()
+    hits = [t for t in bucket.get(user_id, []) if now - t < window]
+    if len(hits) >= limit:
+        bucket[user_id] = hits
+        return False
+    hits.append(now)
+    bucket[user_id] = hits
+    return True
+
+
+async def ensure_role(guild: discord.Guild) -> discord.Role | None:
+    role = discord.utils.get(guild.roles, name=ROLE_NAME)
+    if role is None:
+        try:
+            role = await guild.create_role(
+                name=ROLE_NAME,
+                colour=discord.Colour.from_str("#e5a00d"),
+                reason="Created by displexia",
+            )
+            log.info("Created role %r", ROLE_NAME)
+        except discord.Forbidden:
+            log.error("No permission to create role %r", ROLE_NAME)
+            return None
+    return role
+
+
+async def grant_role(member: discord.Member) -> str:
+    if not isinstance(member, discord.Member):
+        return ""
+    role = await ensure_role(member.guild)
+    if role is None or role in member.roles:
+        return ""
+    try:
+        await member.add_roles(role, reason="Plex invite sent")
+        return f" You've been given the **{ROLE_NAME}** role."
+    except discord.Forbidden:
+        log.error("Missing permission to assign %r (check role order)", ROLE_NAME)
+        return ""
+
+
+def requests_role_ok(member: discord.Member) -> bool:
+    if not REQUESTS_ROLE_NAME:
+        return True
+    return isinstance(member, discord.Member) and \
+        discord.utils.get(member.roles, name=REQUESTS_ROLE_NAME) is not None
+
+
+def requests_role_denial() -> str:
+    where = f"<#{CHANNEL_ID}>" if CHANNEL_ID else f"#{CHANNEL_NAME}"
+    return (f"🔒 You need the **{REQUESTS_ROLE_NAME}** role to request media. "
+            f"Grab Plex access in {where} first!")
+
+
+# ---------------------------------------------------------------- invite flows
+
+RESULT_PREFIX = {"sent": "📬", "pending": "⏳", "updated": "✅", "error": "❌"}
+
+
+async def run_invite(member: discord.Member, email: str) -> tuple[str, str]:
+    email = email.strip()
+    if not EMAIL_RE.fullmatch(email):
+        return ("error", "That doesn't look like a valid email address — try again.")
+    if not check_cooldown(bot.invite_cd, member.id):
+        return ("error", "Too many attempts — wait a few minutes and try again.")
+
+    status, detail = await asyncio.to_thread(invite_email_sync, email)
+    log.info("invite: discord=%s (%s) email=%s -> %s", member, member.id, email, status)
+
+    role_note = ""
+    if status in ("sent", "pending", "updated"):
+        role_note = await grant_role(member)
+
+    if status == "sent":
+        text = (f"Invite sent to `{email}`! Open the invitation email from Plex "
+                f"(check spam too), hit **Accept**, then sign in at <https://app.plex.tv>."
+                f"{role_note}")
+    else:
+        text = f"{detail}{role_note}"
+    return (status, f"{RESULT_PREFIX[status]} {text}")
+
+
+class EmailModal(discord.ui.Modal, title="Get Plex Access"):
+    email = discord.ui.TextInput(label="Your Plex account email",
+                                 placeholder="you@example.com", max_length=120)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        _, text = await run_invite(interaction.user, str(self.email.value))
+        await interaction.followup.send(text, ephemeral=True)
+
+
+class InviteView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Get Plex Access", style=discord.ButtonStyle.success,
+                       emoji="🎟️", custom_id="ztplex:invite")
+    async def invite_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EmailModal())
+
+
+@bot.tree.command(name="plexinvite", description="Get invited to the ztechnus.com Plex server")
+@app_commands.describe(email="The email address of your Plex account")
+async def plexinvite(interaction: discord.Interaction, email: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    _, text = await run_invite(interaction.user, email)
+    await interaction.followup.send(text, ephemeral=True)
+
+
+async def handle_invite_message(message: discord.Message):
+    match = EMAIL_RE.search(message.content or "")
+    if not match:
+        return
+    email = match.group(0)
+    try:
+        await message.delete()
+    except discord.Forbidden:
+        pass
+
+    status, text = await run_invite(message.author, email)
+
+    dm_ok = True
+    try:
+        await message.author.send(text)
+    except discord.Forbidden:
+        dm_ok = False
+
+    note = "📬 I removed your message to keep your email private."
+    if status == "sent":
+        summary = "Your Plex invite is on its way — check your email!"
+    elif status in ("pending", "updated"):
+        summary = "Check your DMs — that address is already set up or invited."
+    else:
+        summary = "That didn't work — check your DMs for details." if dm_ok else text
+    try:
+        await message.channel.send(f"{message.author.mention} {note} {summary}", delete_after=45)
+    except discord.Forbidden:
+        pass
+
+
+# ---------------------------------------------------------------- request flows
+
+TYPE_EMOJI = {"movie": "🎬", "tv": "📺"}
+TYPE_LABEL = {"movie": "Movie", "tv": "TV Show"}
+
+
+def build_options(results: list[dict]) -> list[discord.SelectOption]:
+    opts = []
+    for i, r in enumerate(results):
+        label = f"{r['title']} ({r['year']})" if r["year"] else r["title"]
+        desc = TYPE_LABEL[r["media_type"]]
+        if r["status"] in STATUS_LABEL:
+            desc += f" · {STATUS_LABEL[r['status']].split(' ', 1)[1]}"
+        opts.append(discord.SelectOption(
+            label=label[:100],
+            description=desc[:100],
+            value=f"{r['media_type']}:{r['tmdb_id']}:{i}",
+            emoji=TYPE_EMOJI[r["media_type"]],
+        ))
+    return opts
+
+
+class ResultsView(discord.ui.View):
+    """Select menu of search results, locked to the requester."""
+
+    def __init__(self, requester_id: int, results: list[dict], public_message: discord.Message | None = None):
+        super().__init__(timeout=180)
+        self.requester_id = requester_id
+        self.results = {f"{r['media_type']}:{r['tmdb_id']}:{i}": r for i, r in enumerate(results)}
+        self.public_message = public_message
+        select = discord.ui.Select(placeholder="Pick the title you want…",
+                                   options=build_options(results))
+        select.callback = self.on_pick
+        self.select = select
+        self.add_item(select)
+
+    async def on_timeout(self):
+        if self.public_message:
+            try:
+                await self.public_message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+    async def on_pick(self, interaction: discord.Interaction):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "That menu belongs to someone else — type a title to start your own search.",
+                ephemeral=True)
+            return
+        pick = self.results[self.select.values[0]]
+        await interaction.response.defer()
+        text = await submit_request(interaction.user, pick, interaction.channel)
+        self.select.disabled = True
+        try:
+            await interaction.edit_original_response(content=text, view=None)
+        except discord.HTTPException:
+            # message may be non-ephemeral (typed flow)
+            if self.public_message:
+                await self.public_message.edit(content=text, view=None)
+        self.stop()
+
+
+async def submit_request(member: discord.Member, pick: dict, channel) -> str:
+    label = f"**{pick['title']} ({pick['year']})**" if pick["year"] else f"**{pick['title']}**"
+    emoji = TYPE_EMOJI[pick["media_type"]]
+
+    if pick["status"] == 5:
+        return f"✅ {label} is already on Plex — go watch it!"
+    if pick["status"] in (2, 3):
+        return f"⏳ {label} was already requested — it's in the queue."
+
+    ok, msg = await seerr.request(pick["media_type"], pick["tmdb_id"])
+    log.info("request: discord=%s (%s) %s %s -> %s", member, member.id,
+             pick["media_type"], pick["title"], "ok" if ok else msg)
+    if ok:
+        announce_channel = bot.get_channel(REQUESTS_CHANNEL_ID) or channel
+        try:
+            await announce_channel.send(
+                f"{emoji} **{member.display_name}** requested {label} — added to the download queue.")
+        except discord.Forbidden:
+            pass
+        return (f"{emoji} {label} requested! Seerr sent it to the right place — "
+                f"it'll appear on Plex once it's downloaded.")
+    low = (msg or "").lower()
+    if "already exists" in low or "already" in low:
+        return f"⏳ {label} was already requested — it's in the queue."
+    return f"❌ Couldn't request {label}: {msg}"
+
+
+async def start_request_search(member: discord.Member, query: str):
+    """Returns (error_text, results). error_text set when the flow should stop."""
+    if seerr is None:
+        return ("❌ Requests aren't configured yet (missing Seerr settings). Tell the admin.", None)
+    if not requests_role_ok(member):
+        return (requests_role_denial(), None)
+    if not check_cooldown(bot.request_cd, member.id, limit=5):
+        return ("⏳ Too many searches — give it a few minutes.", None)
+    query = query.strip()
+    if not 2 <= len(query) <= 100:
+        return ("Give me a title between 2 and 100 characters.", None)
+    try:
+        results = await seerr.search(query)
+    except Exception as e:
+        log.exception("Seerr search failed")
+        return (f"❌ Seerr search failed: {str(e)[:150]}", None)
+    if not results:
+        return (f"🔍 No movies or shows found for **{query}** — check the spelling?", None)
+    return (None, results)
+
+
+class RequestModal(discord.ui.Modal, title="Request a movie or show"):
+    query = discord.ui.TextInput(label="Title", placeholder="e.g. Dune Part Two",
+                                 max_length=100)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        err, results = await start_request_search(interaction.user, str(self.query.value))
+        if err:
+            await interaction.followup.send(err, ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"🔍 Results for **{self.query.value}** — pick one:",
+            view=ResultsView(interaction.user.id, results), ephemeral=True)
+
+
+class RequestButtonView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Search & Request", style=discord.ButtonStyle.primary,
+                       emoji="🔎", custom_id="ztplex:request")
+    async def request_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not requests_role_ok(interaction.user):
+            await interaction.response.send_message(requests_role_denial(), ephemeral=True)
+            return
+        await interaction.response.send_modal(RequestModal())
+
+
+@bot.tree.command(name="request", description="Request a movie or TV show for Plex")
+@app_commands.describe(title="What do you want added?")
+async def request_cmd(interaction: discord.Interaction, title: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    err, results = await start_request_search(interaction.user, title)
+    if err:
+        await interaction.followup.send(err, ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"🔍 Results for **{title}** — pick one:",
+        view=ResultsView(interaction.user.id, results), ephemeral=True)
+
+
+async def handle_request_message(message: discord.Message):
+    content = (message.content or "").strip()
+    if not content or content.startswith("/") or EMAIL_RE.search(content):
+        return
+    err, results = await start_request_search(message.author, content)
+    if err:
+        try:
+            await message.reply(err, delete_after=30, mention_author=True)
+        except discord.Forbidden:
+            pass
+        return
+    reply = await message.reply(f"🔍 Results for **{content}** — pick one:",
+                                mention_author=True)
+    view = ResultsView(message.author.id, results, public_message=reply)
+    await reply.edit(view=view)
+
+
+# ---------------------------------------------------------------- channel embeds
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_state(state: dict):
+    STATE_FILE.write_text(json.dumps(state))
+
+
+def build_invite_embed() -> discord.Embed:
+    e = discord.Embed(
+        title="🎬  ztechnus.com Plex — get access",
+        colour=discord.Colour.from_str("#e5a00d"),
+        description=(
+            "Movies, TV shows and music, streamed from the ztechnus.com server.\n\n"
+            "**Three ways to get your invite:**\n"
+            "🎟️ Click **Get Plex Access** below and enter your Plex email\n"
+            "⌨️ Just type your email in this channel (I'll delete it right away)\n"
+            "🔍 Use `/plexinvite email:you@example.com`\n\n"
+            "You'll get an email from Plex — hit **Accept**, then watch at "
+            "[app.plex.tv](https://app.plex.tv) or any Plex app.\n"
+            "Don't have a Plex account? Create one first at "
+            "[plex.tv/sign-up](https://www.plex.tv/sign-up/) with the same email."
+        ),
+    )
+    e.set_footer(text=f"Invites are sent automatically • You'll get the {ROLE_NAME} role")
+    return e
+
+
+def build_request_embed() -> discord.Embed:
+    e = discord.Embed(
+        title="🍿  Request movies & TV shows",
+        colour=discord.Colour.from_str("#5865f2"),
+        description=(
+            "Want something added to Plex? Ask here and it goes straight into the "
+            "download queue.\n\n"
+            "**Three ways to request:**\n"
+            "🔎 Click **Search & Request** below\n"
+            "⌨️ Just type the title in this channel (e.g. `Dune Part Two`)\n"
+            "🎯 Use `/request title:...`\n\n"
+            "Pick the right match from the list I show you, and I'll tell you if "
+            "it's already on Plex or on its way."
+        ),
+    )
+    if REQUESTS_ROLE_NAME:
+        e.set_footer(text=f"Requires the {REQUESTS_ROLE_NAME} role — get it in #{CHANNEL_NAME}")
+    return e
+
+
+async def ensure_channel_message(channel: discord.TextChannel, state_key: str,
+                                 embed: discord.Embed, view: discord.ui.View):
+    state = load_state()
+    msg_id = state.get(state_key)
+    if msg_id:
+        try:
+            msg = await channel.fetch_message(msg_id)
+            await msg.edit(embed=embed, view=view)
+            return
+        except (discord.NotFound, discord.Forbidden):
+            pass
+    msg = await channel.send(embed=embed, view=view)
+    state = load_state()
+    state[state_key] = msg.id
+    save_state(state)
+    log.info("Posted %s in #%s", state_key, channel.name)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or message.guild is None:
+        return
+    if CHANNEL_ID and message.channel.id == CHANNEL_ID:
+        await handle_invite_message(message)
+    elif not CHANNEL_ID and message.channel.name == CHANNEL_NAME:
+        await handle_invite_message(message)
+    elif REQUESTS_CHANNEL_ID and message.channel.id == REQUESTS_CHANNEL_ID:
+        await handle_request_message(message)
+
+
+@bot.event
+async def on_ready():
+    log.info("Logged in as %s (%s)", bot.user, bot.user.id)
+
+    invite_channel = bot.get_channel(CHANNEL_ID) if CHANNEL_ID else None
+    if invite_channel is None:
+        for g in bot.guilds:
+            invite_channel = discord.utils.get(g.text_channels, name=CHANNEL_NAME)
+            if invite_channel:
+                break
+    if invite_channel:
+        await ensure_channel_message(invite_channel, "invite_message_id",
+                                     build_invite_embed(), InviteView())
+        await ensure_role(invite_channel.guild)
+    else:
+        log.error("Could not find the invite channel (#%s)", CHANNEL_NAME)
+
+    if REQUESTS_CHANNEL_ID:
+        req_channel = bot.get_channel(REQUESTS_CHANNEL_ID)
+        if req_channel:
+            await ensure_channel_message(req_channel, "request_message_id",
+                                         build_request_embed(), RequestButtonView())
+        else:
+            log.error("Could not find the requests channel (%s)", REQUESTS_CHANNEL_ID)
+
+    if SETUP_TEST:
+        log.info("SETUP_TEST complete — closing.")
+        await bot.close()
+
+
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
