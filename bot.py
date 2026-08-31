@@ -21,6 +21,7 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 
 from seerr import SeerrClient, STATUS_LABEL
+from stats import BANNER, __version__, bump
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -237,6 +238,7 @@ async def run_invite(member: discord.Member, email: str) -> tuple[str, str]:
 
     status, detail = await asyncio.to_thread(invite_email_sync, email)
     log.info("invite: discord=%s (%s) email=%s -> %s", member, member.id, email, status)
+    bump(f"invite_{status}", member)
 
     role_note = ""
     if status in ("sent", "pending", "updated"):
@@ -268,12 +270,14 @@ class InviteView(discord.ui.View):
     @discord.ui.button(label="Get Plex Access", style=discord.ButtonStyle.success,
                        emoji="🎟️", custom_id="ztplex:invite")
     async def invite_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        bump("invite_button", interaction.user)
         await interaction.response.send_modal(EmailModal())
 
 
 @bot.tree.command(name="plexinvite", description=f"Get invited to the {PLEX_NAME} server")
 @app_commands.describe(email="The email address of your Plex account")
 async def plexinvite(interaction: discord.Interaction, email: str):
+    bump("cmd_plexinvite", interaction.user)
     await interaction.response.defer(ephemeral=True, thinking=True)
     _, text = await run_invite(interaction.user, email)
     await interaction.followup.send(text, ephemeral=True)
@@ -284,6 +288,7 @@ async def handle_invite_message(message: discord.Message):
     if not match:
         return
     email = match.group(0)
+    bump("typed_email", message.author)
     try:
         await message.delete()
     except discord.Forbidden:
@@ -389,6 +394,7 @@ class ResultsView(discord.ui.View):
                 ephemeral=True)
             return
         pick = self.results[self.select.values[0]]
+        bump("pick", interaction.user)
         self.stop()
 
         if self.public:
@@ -444,8 +450,10 @@ async def submit_request(member: discord.Member, pick: dict,
     card = build_media_embed(pick)
 
     if pick["status"] == 5:
+        bump("already_on_plex", member)
         return (f"✅ {label} is already on Plex — go watch it!", card)
     if pick["status"] in (2, 3):
+        bump("already_requested", member)
         return (f"⏳ {label} was already requested — it's in the queue.", card)
 
     try:
@@ -455,6 +463,7 @@ async def submit_request(member: discord.Member, pick: dict,
         return (f"❌ Couldn't reach Seerr: {str(e)[:150] or type(e).__name__}", None)
     log.info("request: discord=%s (%s) %s %s -> %s", member, member.id,
              pick["media_type"], pick["title"], "ok" if ok else msg)
+    bump("request_ok" if ok else "request_fail", member)
     if ok:
         announce_channel = announce_channel_for(pick["media_type"], member, channel)
         try:
@@ -505,6 +514,7 @@ async def mark_available(watch: dict) -> bool:
     try:
         await msg.edit(embed=e)
         log.info("marked available: msg %s (%s)", msg.id, e.title)
+        bump("became_available")
     except discord.HTTPException:
         pass
     return True
@@ -561,6 +571,7 @@ async def start_request_search(member: discord.Member, query: str):
         log.exception("Seerr search failed for %r", query)
         return (f"❌ Seerr search failed: {str(e)[:150]}", None)
     log.info("search: %s (%s) %r -> %d results", member, member.id, query, len(results))
+    bump("search", member)
     if not results:
         return (f"🔍 No movies or shows found for **{query}** — check the spelling?", None)
     return (None, results)
@@ -589,6 +600,7 @@ class RequestButtonView(discord.ui.View):
     @discord.ui.button(label="Search & Request", style=discord.ButtonStyle.primary,
                        emoji="🔎", custom_id="ztplex:request")
     async def request_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        bump("request_button", interaction.user)
         if not requests_role_ok(interaction.user):
             await interaction.response.send_message(requests_role_denial(), ephemeral=True)
             return
@@ -598,6 +610,7 @@ class RequestButtonView(discord.ui.View):
 @bot.tree.command(name="request", description="Request a movie or TV show for Plex")
 @app_commands.describe(title="What do you want added?")
 async def request_cmd(interaction: discord.Interaction, title: str):
+    bump("cmd_request", interaction.user)
     await interaction.response.defer(ephemeral=True, thinking=True)
     err, results = await start_request_search(interaction.user, title)
     if err:
@@ -612,6 +625,7 @@ async def handle_request_message(message: discord.Message):
     content = (message.content or "").strip()
     if not content or content.startswith("/") or EMAIL_RE.search(content):
         return
+    bump("typed_request", message.author)
     # Keep the channel clean: the typed title disappears, the menu self-destructs,
     # and only the post-request announcement is ever left behind.
     try:
@@ -789,4 +803,6 @@ async def on_ready():
 
 
 if __name__ == "__main__":
+    print(BANNER)
+    print(f"  displexia v{__version__} — Plex invites + Seerr requests for Discord\n")
     bot.run(DISCORD_TOKEN)

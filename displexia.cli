@@ -1,0 +1,29 @@
+#!/bin/bash
+# displexia CLI — installed to /usr/local/bin/displexia by setup.sh
+DIR="__DIR__"
+
+case "$1" in
+    update)  exec bash "$DIR/update.sh" ;;
+    stats)   exec "$DIR/venv/bin/python" "$DIR/stats.py" ;;
+    logs)    exec journalctl -u displexia -f ;;
+    status)  exec systemctl --no-pager status displexia ;;
+    restart) systemctl restart displexia && echo "displexia restarted." ;;
+    *)
+        "$DIR/venv/bin/python" - <<'PY'
+from stats import BANNER, __version__
+print(BANNER)
+print(f"  displexia v{__version__} — Plex invites + Seerr requests for Discord")
+PY
+        cat <<'USAGE'
+
+  usage: displexia <command>
+
+    update    pull the latest code, install deps, restart the bot
+    stats     usage report — every button press, search, request, per user
+    logs      follow the live bot logs
+    status    systemd service status
+    restart   restart the bot
+
+USAGE
+        ;;
+esac

@@ -43,6 +43,10 @@ if grep -q '^PLEX_TOKEN=$' .env; then
     ./venv/bin/python get_plex_token.py
 fi
 
+echo "==> Installing the displexia CLI (/usr/local/bin/displexia)"
+sed "s|__DIR__|$DIR|g" displexia.cli > /usr/local/bin/displexia
+chmod +x /usr/local/bin/displexia
+
 echo "==> Installing systemd service (displexia)"
 sed "s|__DIR__|$DIR|g" displexia.service > /etc/systemd/system/displexia.service
 systemctl daemon-reload

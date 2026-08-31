@@ -1,6 +1,7 @@
 # secrets + runtime state — never commit
 .env
 state.json
+stats.json
 .env.migrated
 
 # python
