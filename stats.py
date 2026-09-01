@@ -8,7 +8,7 @@ import json
 import time
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 BANNER = r"""
 ██████╗ ██╗███████╗██████╗ ██╗     ███████╗██╗  ██╗██╗ █████╗
@@ -39,6 +39,9 @@ EVENT_LABELS = {
     "invite_updated":    "🔄  Library shares refreshed",
     "invite_error":      "❌  Invite errors",
     "became_available":  "🟢  Cards flipped to available",
+    "cmd_mystatus":      "📈  /mystatus checks",
+    "new_on_plex":       "🆕  New-on-Plex announcements",
+    "revoked":           "🔐  Plex shares auto-revoked",
 }
 
 

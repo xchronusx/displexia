@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import time
+from itertools import zip_longest
 from pathlib import Path
 
 import discord
@@ -20,6 +21,7 @@ from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 
+from arr import ArrClient
 from seerr import SeerrClient, STATUS_LABEL
 from stats import BANNER, __version__, bump
 
@@ -52,6 +54,24 @@ AVAILABLE_TEXT = f"Available to watch on {PLEX_LINK} now" if PLEX_LINK \
     else "Available to watch on Plex now"
 AVAILABLE_COLOUR = "#2ecc71"   # cards flip from Plex gold to green when watchable
 WATCH_MAX_AGE = 30 * 86400     # stop polling a request after 30 days
+
+# Request backend: "seerr", "arr" (native Radarr/Sonarr), or "auto"
+# (auto = Seerr when configured, else whichever arr apps are configured)
+REQUEST_BACKEND = os.environ.get("REQUEST_BACKEND", "auto").strip().lower()
+RADARR_URL = os.environ.get("RADARR_URL", "").strip()
+RADARR_API_KEY = os.environ.get("RADARR_API_KEY", "").strip()
+RADARR_PROFILE = os.environ.get("RADARR_PROFILE", "").strip()
+RADARR_ROOT = os.environ.get("RADARR_ROOT", "").strip()
+SONARR_URL = os.environ.get("SONARR_URL", "").strip()
+SONARR_API_KEY = os.environ.get("SONARR_API_KEY", "").strip()
+SONARR_PROFILE = os.environ.get("SONARR_PROFILE", "").strip()
+SONARR_ROOT = os.environ.get("SONARR_ROOT", "").strip()
+
+# Extra channels (name or ID; empty = feature off)
+STATUS_CHANNEL = os.environ.get("STATUS_CHANNEL", "").strip().lstrip("#")
+NEW_CHANNEL = os.environ.get("NEW_CHANNEL", "").strip().lstrip("#")
+# Revoke the Plex share when someone leaves or loses REQUESTS_ROLE_NAME
+AUTO_REVOKE = os.environ.get("AUTO_REVOKE", "0") == "1"
 SETUP_TEST = os.environ.get("SETUP_TEST") == "1"
 
 STATE_FILE = BASE_DIR / "state.json"
@@ -61,6 +81,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("displexia")
 
 seerr = SeerrClient(OVERSEERR_URL, OVERSEERR_API_KEY) if OVERSEERR_URL and OVERSEERR_API_KEY else None
+radarr = ArrClient("radarr", RADARR_URL, RADARR_API_KEY, RADARR_PROFILE, RADARR_ROOT) \
+    if RADARR_URL and RADARR_API_KEY else None
+sonarr = ArrClient("sonarr", SONARR_URL, SONARR_API_KEY, SONARR_PROFILE, SONARR_ROOT) \
+    if SONARR_URL and SONARR_API_KEY else None
+
+
+def active_backend() -> str:
+    """'seerr', 'arr', or '' when nothing is configured."""
+    if REQUEST_BACKEND == "seerr":
+        return "seerr" if seerr else ""
+    if REQUEST_BACKEND == "arr":
+        return "arr" if (radarr or sonarr) else ""
+    if seerr:
+        return "seerr"
+    return "arr" if (radarr or sonarr) else ""
 
 # ---------------------------------------------------------------- Plex invites
 
@@ -141,6 +176,8 @@ def invite_email_sync(email: str):
 
 intents = discord.Intents.default()
 intents.message_content = True
+if AUTO_REVOKE:
+    intents.members = True  # needs "Server Members Intent" enabled in the dev portal
 
 
 class Displexia(discord.Client):
@@ -159,8 +196,9 @@ class Displexia(discord.Client):
             await self.tree.sync(guild=guild)
 
     async def close(self):
-        if seerr:
-            await seerr.close()
+        for client in (seerr, radarr, sonarr):
+            if client:
+                await client.close()
         await super().close()
 
 
@@ -243,6 +281,9 @@ async def run_invite(member: discord.Member, email: str) -> tuple[str, str]:
     role_note = ""
     if status in ("sent", "pending", "updated"):
         role_note = await grant_role(member)
+        state = load_state()                     # remember email for auto-revoke
+        state.setdefault("emails", {})[str(member.id)] = email
+        save_state(state)
 
     if status == "sent":
         text = (f"Invite sent to `{email}`! Open the invitation email from Plex "
@@ -425,6 +466,40 @@ class ResultsView(discord.ui.View):
                             interaction.user, interaction.user.id)
 
 
+async def search_media(query: str) -> list[dict]:
+    """Search via the active backend; arr mode merges Radarr + Sonarr results."""
+    if active_backend() == "seerr":
+        results = await seerr.search(query)
+        for r in results:
+            r["backend"] = "seerr"
+        return results
+    lookups = [c.lookup(query, limit=4) for c in (radarr, sonarr) if c]
+    groups = await asyncio.gather(*lookups, return_exceptions=True)
+    lists = [g for g in groups if isinstance(g, list)]
+    errors = [g for g in groups if isinstance(g, BaseException)]
+    if not lists:
+        raise errors[0] if errors else RuntimeError("no arr apps configured")
+    out = []
+    for pair in zip_longest(*lists):                 # interleave movies & tv
+        out.extend(x for x in pair if x)
+    return out[:8]
+
+
+async def request_media(pick: dict) -> tuple[bool, str, dict | None]:
+    """Submit to the right backend. Returns (ok, message, watch_info)."""
+    if pick.get("backend") == "arr":
+        client = radarr if pick["media_type"] == "movie" else sonarr
+        if client is None:
+            return (False, f"no {'Radarr' if pick['media_type'] == 'movie' else 'Sonarr'} configured", None)
+        ok, msg, arr_id = await client.add(pick["arr_raw"])
+        info = {"backend": "arr", "kind": client.kind, "arr_id": arr_id} \
+            if ok and arr_id else None
+        return (ok, msg, info)
+    ok, msg, media_id = await seerr.request(pick["media_type"], pick["tmdb_id"])
+    info = {"backend": "seerr", "media_id": media_id} if ok and media_id else None
+    return (ok, msg, info)
+
+
 def announce_channel_for(media_type: str, member, fallback_channel):
     """Route the announcement card: #movies / #tv if configured, else requests channel."""
     conf = ANNOUNCE_CHANNEL.get(media_type, "")
@@ -457,21 +532,22 @@ async def submit_request(member: discord.Member, pick: dict,
         return (f"⏳ {label} was already requested — it's in the queue.", card)
 
     try:
-        ok, msg, media_id = await seerr.request(pick["media_type"], pick["tmdb_id"])
+        ok, msg, watch_info = await request_media(pick)
     except Exception as e:
-        log.exception("Seerr request errored for %s %s", pick["media_type"], pick["tmdb_id"])
-        return (f"❌ Couldn't reach Seerr: {str(e)[:150] or type(e).__name__}", None)
-    log.info("request: discord=%s (%s) %s %s -> %s", member, member.id,
-             pick["media_type"], pick["title"], "ok" if ok else msg)
+        log.exception("Request errored for %s %s", pick["media_type"], pick["tmdb_id"])
+        return (f"❌ Couldn't reach the request backend: {str(e)[:150] or type(e).__name__}", None)
+    log.info("request[%s]: discord=%s (%s) %s %s -> %s", pick.get("backend", "seerr"),
+             member, member.id, pick["media_type"], pick["title"], "ok" if ok else msg)
     bump("request_ok" if ok else "request_fail", member)
     if ok:
         announce_channel = announce_channel_for(pick["media_type"], member, channel)
         try:
             ann = await announce_channel.send(embed=build_media_embed(
                 pick, footer=f"Requested by {member.display_name} • added to the download queue"))
-            if media_id and ann:
-                add_watch(media_id, getattr(announce_channel, "id", 0), ann.id,
-                          member.display_name)
+            track_request(member, pick, ann.id if ann else 0)
+            if watch_info and ann:
+                add_watch(watch_info, getattr(announce_channel, "id", 0), ann.id,
+                          member.display_name, member.id, pick["title"])
         except discord.Forbidden:
             pass
         if getattr(announce_channel, "id", None) == REQUESTS_CHANNEL_ID:
@@ -487,18 +563,46 @@ async def submit_request(member: discord.Member, pick: dict,
 
 # --- availability watcher: flip announcement cards to green once watchable ---
 
-def add_watch(media_id: int, channel_id: int, message_id: int, requester: str):
+def add_watch(info: dict, channel_id: int, message_id: int,
+              requester: str, requester_id: int = 0, title: str = ""):
     state = load_state()
     state.setdefault("watches", []).append({
-        "media_id": media_id, "channel_id": channel_id,
-        "message_id": message_id, "requester": requester, "added": time.time(),
+        **info, "channel_id": channel_id, "message_id": message_id,
+        "requester": requester, "requester_id": requester_id,
+        "title": title, "added": time.time(),
     })
     save_state(state)
-    log.info("watching seerr media %s for availability (msg %s)", media_id, message_id)
+    log.info("watching %s for availability (msg %s)", info, message_id)
+
+
+def track_request(member, pick: dict, message_id: int):
+    """Per-user request history that powers /mystatus."""
+    state = load_state()
+    hist = state.setdefault("requests", {}).setdefault(str(member.id), [])
+    hist.append({"title": pick["title"], "year": pick["year"],
+                 "type": pick["media_type"], "ts": time.time(),
+                 "status": "queued", "msg": message_id})
+    del hist[:-15]                        # keep the last 15 per user
+    save_state(state)
+
+
+def _mark_history_available(state: dict, requester_id: int, message_id: int):
+    for entry in state.get("requests", {}).get(str(requester_id), []):
+        if entry.get("msg") == message_id:
+            entry["status"] = "available"
+
+
+async def _watch_status(w: dict) -> int | None:
+    if w.get("backend") == "arr":
+        client = radarr if w.get("kind") == "radarr" else sonarr
+        return await client.is_available(w["arr_id"]) if client else None
+    if seerr is None or "media_id" not in w:
+        return None
+    return await seerr.media_status(w["media_id"])
 
 
 async def mark_available(watch: dict) -> bool:
-    """Edit the announcement card: green + 'Available to watch' footer."""
+    """Green card + footer flip, 🎉 ping the requester, update their history."""
     channel = bot.get_channel(watch["channel_id"])
     if channel is None:
         return True                       # channel gone — stop watching
@@ -506,39 +610,49 @@ async def mark_available(watch: dict) -> bool:
         msg = await channel.fetch_message(watch["message_id"])
     except discord.HTTPException:
         return True                       # message deleted — stop watching
-    if not msg.embeds:
-        return True
-    e = msg.embeds[0]
-    e.colour = discord.Colour.from_str(AVAILABLE_COLOUR)
-    e.set_footer(text=f"Requested by {watch['requester']} • {AVAILABLE_TEXT}")
-    try:
-        await msg.edit(embed=e)
-        log.info("marked available: msg %s (%s)", msg.id, e.title)
-        bump("became_available")
-    except discord.HTTPException:
-        pass
+    if msg.embeds:
+        e = msg.embeds[0]
+        e.colour = discord.Colour.from_str(AVAILABLE_COLOUR)
+        e.set_footer(text=f"Requested by {watch['requester']} • {AVAILABLE_TEXT}")
+        try:
+            await msg.edit(embed=e)
+            log.info("marked available: msg %s (%s)", msg.id, e.title)
+            bump("became_available")
+        except discord.HTTPException:
+            pass
+    if watch.get("requester_id"):
+        try:
+            await channel.send(
+                f"🎉 <@{watch['requester_id']}> — **{watch.get('title', 'your request')}** "
+                f"is ready! {AVAILABLE_TEXT}.")
+        except discord.HTTPException:
+            pass
     return True
 
 
 async def check_watches():
     watches = load_state().get("watches", [])
-    if not watches or seerr is None:
+    if not watches:
         return
     drop: set[int] = set()
+    available: list[dict] = []
     for w in watches:
         try:
-            status = await seerr.media_status(w["media_id"])
+            status = await _watch_status(w)
         except Exception:
-            continue                      # Seerr unreachable — try again next cycle
+            continue                      # backend unreachable — try again next cycle
         if status in (4, 5):              # partially or fully available
             await mark_available(w)
             drop.add(w["message_id"])
+            available.append(w)
         elif time.time() - w.get("added", 0) > WATCH_MAX_AGE:
             drop.add(w["message_id"])     # stale — give up quietly
     if drop:
         state = load_state()
         state["watches"] = [w for w in state.get("watches", [])
                             if w["message_id"] not in drop]
+        for w in available:
+            _mark_history_available(state, w.get("requester_id", 0), w["message_id"])
         save_state(state)
 
 
@@ -552,10 +666,253 @@ async def _wait_ready():
     await bot.wait_until_ready()
 
 
+# --- live status board (#plex-status) + new-on-plex feed ---------------------
+
+def resolve_channel(conf: str):
+    """Channel name or ID from .env -> channel, or None."""
+    if not conf:
+        return None
+    if conf.isdigit():
+        return bot.get_channel(int(conf))
+    for g in bot.guilds:
+        ch = discord.utils.get(g.text_channels, name=conf)
+        if ch:
+            return ch
+    return None
+
+
+def _fmt_bytes(n: int) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+    return "?"
+
+
+def _plex_sessions_sync() -> list[str] | None:
+    if not (PLEX_TOKEN and PLEX_URL):
+        return None
+    plex = _connect_server()
+    lines = []
+    for s in plex.sessions():
+        user = (s.usernames or ["?"])[0]
+        if s.type == "episode":
+            title = f"{s.grandparentTitle} · S{s.parentIndex:02}E{s.index:02}"
+        else:
+            title = s.title
+        pct = int(100 * (s.viewOffset or 0) / s.duration) if s.duration else 0
+        lines.append(f"**{user}** — {title[:55]} ({pct}%)")
+    return lines
+
+
+async def build_status_embed() -> discord.Embed:
+    e = discord.Embed(title=f"📊  {PLEX_NAME} — live status",
+                      colour=discord.Colour.from_str("#e5a00d"))
+    try:
+        streams = await asyncio.to_thread(_plex_sessions_sync)
+    except Exception as ex:
+        log.warning("status board: plex sessions failed: %s", ex)
+        streams = None
+    if streams is None:
+        e.add_field(name="🎞️ Now streaming", value="*(Plex not reachable)*", inline=False)
+    else:
+        e.add_field(name=f"🎞️ Now streaming — {len(streams)}",
+                    value="\n".join(streams[:6]) or "Nobody right now", inline=False)
+
+    for client, label in ((radarr, "🎬 Radarr queue"), (sonarr, "📺 Sonarr queue")):
+        if client is None:
+            continue
+        try:
+            total, top = await client.queue_summary()
+            e.add_field(name=f"{label} — {total}",
+                        value="\n".join(top) or "Empty", inline=True)
+        except Exception as ex:
+            e.add_field(name=label, value=f"*(unreachable: {str(ex)[:40]})*", inline=True)
+
+    disks, seen_paths = [], set()
+    for client in (radarr, sonarr):
+        if client is None:
+            continue
+        try:
+            for path, free, total in await client.disk_space():
+                if path in seen_paths or not total:
+                    continue
+                seen_paths.add(path)
+                disks.append(f"`{path}` — {_fmt_bytes(free)} free of {_fmt_bytes(total)}")
+        except Exception:
+            pass
+    if disks:
+        e.add_field(name="💾 Disk", value="\n".join(disks[:5]), inline=False)
+    e.set_footer(text=f"displexia v{__version__} • refreshes every 60s")
+    e.timestamp = discord.utils.utcnow()
+    return e
+
+
+_status_msg: discord.Message | None = None
+
+
+@tasks.loop(seconds=60)
+async def status_board():
+    global _status_msg
+    channel = resolve_channel(STATUS_CHANNEL)
+    if channel is None:
+        return
+    try:
+        embed = await build_status_embed()
+    except Exception:
+        log.exception("status board build failed")
+        return
+    if _status_msg is not None:
+        try:
+            await _status_msg.edit(embed=embed)
+            return
+        except discord.HTTPException:
+            _status_msg = None
+    state = load_state()
+    mid = state.get("status_message_id")
+    if mid:
+        try:
+            _status_msg = await channel.fetch_message(mid)
+            await _status_msg.edit(embed=embed)
+            return
+        except discord.HTTPException:
+            _status_msg = None
+    try:
+        _status_msg = await channel.send(embed=embed)
+    except discord.Forbidden:
+        log.error("Cannot post the status board in #%s", channel)
+        return
+    state = load_state()
+    state["status_message_id"] = _status_msg.id
+    save_state(state)
+
+
+@status_board.before_loop
+async def _status_wait_ready():
+    await bot.wait_until_ready()
+
+
+def _new_label(it: dict) -> str:
+    year = f" ({it['year']})" if it.get("year") else ""
+    return f"{it['title']}{year}"
+
+
+def _recently_added_sync(limit: int = 30) -> list[dict]:
+    plex = _connect_server()
+    out = []
+    for it in plex.library.recentlyAdded()[:limit]:
+        kind = getattr(it, "type", "?")
+        if kind == "episode":
+            title = f"{it.grandparentTitle} — S{it.parentIndex:02}E{it.index:02} · {it.title}"
+        elif kind == "season":
+            title = f"{it.parentTitle} — {it.title}"
+        else:
+            title = getattr(it, "title", "?")
+        out.append({"key": str(it.ratingKey), "kind": kind, "title": title,
+                    "year": getattr(it, "year", None),
+                    "summary": (getattr(it, "summary", "") or "")[:280]})
+    return out
+
+
+@tasks.loop(minutes=5)
+async def new_on_plex():
+    channel = resolve_channel(NEW_CHANNEL)
+    if channel is None or not (PLEX_TOKEN and PLEX_URL):
+        return
+    try:
+        items = await asyncio.to_thread(_recently_added_sync)
+    except Exception as ex:
+        log.warning("new-on-plex: %s", ex)
+        return
+    state = load_state()
+    seen = state.get("plex_seen")
+    keys = [i["key"] for i in items]
+    if seen is None:                       # first pass: baseline quietly
+        state["plex_seen"] = keys
+        save_state(state)
+        log.info("new-on-plex: baselined %d items", len(keys))
+        return
+    fresh = [i for i in items if i["key"] not in set(seen)]
+    for it in reversed(fresh[:5]):         # oldest first, max 5 per pass
+        emoji = "🎬" if it["kind"] == "movie" else "📺"
+        e = discord.Embed(title=f"🆕 {emoji}  {_new_label(it)}",
+                          description=it["summary"] or None,
+                          colour=discord.Colour.from_str(AVAILABLE_COLOUR))
+        e.set_footer(text=f"Now on {PLEX_NAME}")
+        try:
+            await channel.send(embed=e)
+            bump("new_on_plex")
+        except discord.HTTPException:
+            break
+    state = load_state()
+    state["plex_seen"] = keys
+    save_state(state)
+
+
+@new_on_plex.before_loop
+async def _new_wait_ready():
+    await bot.wait_until_ready()
+
+
+# --- auto-revoke: pull the Plex share when someone leaves or loses the role --
+
+def revoke_email_sync(email: str) -> bool:
+    acct = _connect_account()
+    email_l = email.lower()
+    for u in acct.users():
+        if (u.email or "").lower() == email_l or (u.username or "").lower() == email_l:
+            acct.removeFriend(u)
+            return True
+    try:
+        for inv in acct.pendingInvites(includeSent=True, includeReceived=False):
+            if (getattr(inv, "email", "") or "").lower() == email_l:
+                acct.cancelInvite(inv)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def revoke_member(member, reason: str):
+    state = load_state()
+    email = state.get("emails", {}).get(str(member.id))
+    if not email:
+        return
+    try:
+        ok = await asyncio.to_thread(revoke_email_sync, email)
+    except Exception as ex:
+        log.warning("revoke failed for %s: %s", member, ex)
+        return
+    log.info("revoke: %s (%s) %s -> %s", member, member.id, reason,
+             "removed" if ok else "no plex share found")
+    if ok:
+        bump("revoked", member)
+        state = load_state()
+        state.get("emails", {}).pop(str(member.id), None)
+        save_state(state)
+
+
+@bot.event
+async def on_member_remove(member):
+    if AUTO_REVOKE:
+        await revoke_member(member, "left the server")
+
+
+@bot.event
+async def on_member_update(before, after):
+    if not AUTO_REVOKE or not ROLE_NAME:
+        return
+    had = discord.utils.get(before.roles, name=ROLE_NAME)
+    has = discord.utils.get(after.roles, name=ROLE_NAME)
+    if had and not has:
+        await revoke_member(after, f"lost the {ROLE_NAME} role")
+
+
 async def start_request_search(member: discord.Member, query: str):
     """Returns (error_text, results). error_text set when the flow should stop."""
-    if seerr is None:
-        return ("❌ Requests aren't configured yet (missing Seerr settings). Tell the admin.", None)
+    if not active_backend():
+        return ("❌ Requests aren't configured yet (no Seerr or Radarr/Sonarr settings). "
+                "Tell the admin.", None)
     if not requests_role_ok(member):
         log.info("search denied (missing %r role): %s (%s)", REQUESTS_ROLE_NAME, member, member.id)
         return (requests_role_denial(), None)
@@ -566,10 +923,10 @@ async def start_request_search(member: discord.Member, query: str):
     if not 2 <= len(query) <= 100:
         return ("Give me a title between 2 and 100 characters.", None)
     try:
-        results = await seerr.search(query)
+        results = await search_media(query)
     except Exception as e:
-        log.exception("Seerr search failed for %r", query)
-        return (f"❌ Seerr search failed: {str(e)[:150]}", None)
+        log.exception("Search failed for %r", query)
+        return (f"❌ Search failed: {str(e)[:150]}", None)
     log.info("search: %s (%s) %r -> %d results", member, member.id, query, len(results))
     bump("search", member)
     if not results:
@@ -619,6 +976,28 @@ async def request_cmd(interaction: discord.Interaction, title: str):
     view = ResultsView(interaction.user.id, results)
     view.menu_message = await interaction.followup.send(
         f"🔍 Results for **{title}** — pick one:", view=view, ephemeral=True)
+
+
+@bot.tree.command(name="mystatus", description="Your recent requests and where they are")
+async def mystatus(interaction: discord.Interaction):
+    bump("cmd_mystatus", interaction.user)
+    hist = load_state().get("requests", {}).get(str(interaction.user.id), [])
+    if not hist:
+        await interaction.response.send_message(
+            "You haven't requested anything yet — hit **Search & Request** or use `/request`!",
+            ephemeral=True)
+        return
+    icon = {"queued": "⏳", "available": "🟢"}
+    lines = []
+    for h in reversed(hist):
+        year = f" ({h['year']})" if h.get("year") else ""
+        when = time.strftime("%b %d", time.localtime(h.get("ts", 0)))
+        lines.append(f"{icon.get(h.get('status'), '⏳')} {TYPE_EMOJI.get(h.get('type'), '')} "
+                     f"**{h['title']}{year}** — {h.get('status', 'queued')} · {when}")
+    e = discord.Embed(title="📈 Your requests",
+                      description="\n".join(lines[:15]),
+                      colour=discord.Colour.from_str("#5865f2"))
+    await interaction.response.send_message(embed=e, ephemeral=True)
 
 
 async def handle_request_message(message: discord.Message):
@@ -697,7 +1076,8 @@ def build_request_embed() -> discord.Embed:
             "I'll tidy your message away\n"
             "🎯 Use `/request title:...`\n\n"
             "Searching and picking happens privately — nothing shows up here "
-            "until your request is actually sent."
+            "until your request is actually sent.\n"
+            "📈 `/mystatus` shows your requests and pings you when they're ready."
         ),
     )
     if REQUESTS_ROLE_NAME:
@@ -773,8 +1153,23 @@ async def on_ready():
     if not REQUESTS_CHANNEL_ID:
         log.warning("REQUESTS_CHANNEL_ID missing from .env — typed requests and "
                     "the requests embed are disabled.")
-    if seerr is not None and not watch_available.is_running():
+    backend = active_backend()
+    if not backend:
+        log.warning("No request backend configured (Seerr or Radarr/Sonarr) — "
+                    "media requests are disabled!")
+    else:
+        log.info("request backend: %s%s", backend,
+                 "" if backend == "seerr" else
+                 f" (radarr={'on' if radarr else 'off'}, sonarr={'on' if sonarr else 'off'})")
+    if backend and not watch_available.is_running():
         watch_available.start()
+    if STATUS_CHANNEL and not status_board.is_running():
+        status_board.start()
+    if NEW_CHANNEL and PLEX_TOKEN and not new_on_plex.is_running():
+        new_on_plex.start()
+    if AUTO_REVOKE:
+        log.info("auto-revoke armed: leaving the server or losing %r pulls the Plex share",
+                 ROLE_NAME)
 
     invite_channel = bot.get_channel(CHANNEL_ID) if CHANNEL_ID else None
     if invite_channel is None:
@@ -804,5 +1199,12 @@ async def on_ready():
 
 if __name__ == "__main__":
     print(BANNER)
-    print(f"  displexia v{__version__} — Plex invites + Seerr requests for Discord\n")
-    bot.run(DISCORD_TOKEN)
+    print(f"  displexia v{__version__} — Plex invites + media requests for Discord\n")
+    try:
+        bot.run(DISCORD_TOKEN)
+    except discord.PrivilegedIntentsRequired:
+        log.error("AUTO_REVOKE=1 needs the 'Server Members Intent' toggle: "
+                  "Discord Developer Portal → your app → Bot → Privileged Gateway "
+                  "Intents → Server Members Intent → ON. Enable it (or set "
+                  "AUTO_REVOKE=0) and restart.")
+        raise SystemExit(1)

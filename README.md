@@ -9,7 +9,7 @@
 ╚═════╝ ╚═╝╚══════╝╚═╝     ╚══════╝╚══════╝╚═╝  ╚═╝╚═╝╚═╝  ╚═╝
 ```
 
-**The Discord front door for your Plex server.** Automatic library invites + media requests, wired to [Plex](https://www.plex.tv) and Seerr ([Overseerr](https://overseerr.dev) / [Jellyseerr](https://github.com/fallenbagel/jellyseerr)). Point it at your own servers via `.env` — nothing is hardcoded. MIT licensed, one-command install, one-command updates.
+**The Discord front door for your Plex server.** Automatic library invites + media requests for **any** stack: use Seerr ([Overseerr](https://overseerr.dev) / [Jellyseerr](https://github.com/fallenbagel/jellyseerr)) **or** talk natively to [Radarr](https://radarr.video) + [Sonarr](https://sonarr.tv) — no Seerr required. Point it at your own servers via `.env` — nothing is hardcoded. MIT licensed, one-command install, one-command updates.
 
 ## Features
 
@@ -29,6 +29,14 @@
 - When the download lands, the card turns **green**: *"Requested by X • Available to watch on plex.yourdomain.com now"* (polled from Seerr every 5 min, survives restarts)
 - Knows what's already on Plex or queued, and says so instead of double-requesting
 - The button embeds re-post themselves so they always sit at the bottom of their channel
+- **Pluggable backend** (`REQUEST_BACKEND`): `seerr` routes through Overseerr/Jellyseerr; `arr` searches and adds straight to Radarr/Sonarr (picks your quality profile by name, first root folder by default, kicks off the search); `auto` prefers Seerr when configured
+- 🎉 Requesters get pinged when their title lands; `/mystatus` shows everyone their own request history, privately
+
+**Server extras (optional channels)**
+
+- 📊 **Live status board** (`STATUS_CHANNEL`): one embed, edited every 60s — who's streaming what on Plex, Radarr/Sonarr queue depth + ETAs, disk space
+- 🆕 **New-on-Plex feed** (`NEW_CHANNEL`): announces new arrivals; baselines silently on first run so it never spams history
+- 🔐 **Auto-revoke** (`AUTO_REVOKE=1`): leaving the server or losing the member role pulls the Plex share (and cancels pending invites) automatically
 
 **Ops**
 
@@ -82,7 +90,14 @@ displexia restart    restart the bot
 | `DISCORD_TOKEN` | Bot token — [Discord Developer Portal](https://discord.com/developers/applications) → your app → Bot → Reset Token |
 | `GUILD_ID` / `CHANNEL_ID` / `REQUESTS_CHANNEL_ID` | Your server, invite channel, and requests channel IDs (enable Developer Mode, right-click → Copy ID) |
 | `PLEX_URL` / `PLEX_TOKEN` | Plex server URL (e.g. `http://192.168.1.10:32400`) + account token (`setup.sh` can fetch it via plex.tv/link) |
+| `REQUEST_BACKEND` | `auto` (default), `seerr`, or `arr` — how requests are submitted |
 | `OVERSEERR_URL` / `OVERSEERR_API_KEY` | Seerr base URL (e.g. `http://192.168.1.11:5055`) + API key (Seerr → Settings → General) |
+| `RADARR_URL` / `RADARR_API_KEY` | Radarr base URL (e.g. `http://192.168.1.12:7878`) + API key (Settings → General) |
+| `SONARR_URL` / `SONARR_API_KEY` | Sonarr base URL (e.g. `http://192.168.1.13:8989`) + API key (Settings → General) |
+| `RADARR_PROFILE` / `SONARR_PROFILE` | Quality profile *name* to add with (empty = first profile) |
+| `RADARR_ROOT` / `SONARR_ROOT` | Root folder path override (empty = first root folder) |
+| `STATUS_CHANNEL` / `NEW_CHANNEL` | Live status board / new-arrivals channels, by name or ID (empty = off) |
+| `AUTO_REVOKE` | `1` = revoke the Plex share on leave/role loss (needs Server Members Intent) |
 | `MOVIES_CHANNEL` / `TV_CHANNEL` | Where announcement cards go, per type — channel name (`movies`, `tv`) or ID; empty = the requests channel |
 | `PLEX_LINK` | Shown on green "available" cards, e.g. `plex.yourdomain.com` (empty = "Plex") |
 | `SERVER_NAME` | Branding shown in embeds/commands, e.g. `yourdomain.com` (empty = plain "Plex") |
@@ -93,15 +108,17 @@ displexia restart    restart the bot
 ## Discord app setup
 
 1. Create an app at the [Developer Portal](https://discord.com/developers/applications), add a Bot, copy the token.
-2. Bot → Privileged Gateway Intents → enable **Message Content Intent**.
+2. Bot → Privileged Gateway Intents → enable **Message Content Intent** (and **Server Members Intent** if you set `AUTO_REVOKE=1`).
 3. Invite it with permissions: View Channels, Send Messages, Embed Links, Read Message History, **Manage Messages** (deletes typed emails/titles), **Manage Roles**.
 4. Server Settings → Roles: drag the bot's role **above** `ROLE_NAME`.
 
 ## Project layout
 
 ```
-bot.py             the Discord bot (invites, requests, cards, watcher, sticky embeds)
+bot.py             the Discord bot (invites, requests, cards, watcher, sticky embeds,
+                   status board, new-on-plex feed, auto-revoke)
 seerr.py           tiny async Overseerr/Jellyseerr API client
+arr.py             tiny async native Radarr/Sonarr v3+ API client
 stats.py           usage counters + the `displexia stats` report
 get_plex_token.py  plex.tv/link token helper (used by setup.sh)
 setup.sh           installer: deps, token flow, systemd service, CLI
