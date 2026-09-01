@@ -1,8 +1,10 @@
 """Tiny async client for the Overseerr/Jellyseerr/Seerr API."""
 
 import logging
+from urllib.parse import quote
 
 import aiohttp
+from yarl import URL
 
 log = logging.getLogger("displexia.seerr")
 
@@ -36,9 +38,15 @@ class SeerrClient:
     async def search(self, query: str, limit: int = 8) -> list[dict]:
         """Returns simplified results: title, year, media_type, tmdb_id, status."""
         s = await self._sess()
-        async with s.get(f"{self.base}/api/v1/search",
-                         params={"query": query, "page": "1"}) as r:
-            r.raise_for_status()
+        # Encode exactly like the Seerr web UI (%20 for spaces, never '+') —
+        # some builds reject '+'-encoded queries with a 400.
+        url = URL(f"{self.base}/api/v1/search?query={quote(query, safe='')}&page=1",
+                  encoded=True)
+        async with s.get(url) as r:
+            if r.status != 200:
+                body = await self._safe_message(r)
+                log.warning("Seerr search HTTP %s for %r: %s", r.status, query, body)
+                raise RuntimeError(f"Seerr answered HTTP {r.status}: {body}")
             data = await r.json()
         out = []
         for item in data.get("results", []):
