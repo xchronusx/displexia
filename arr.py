@@ -17,7 +17,8 @@ class ArrClient:
     """One client per app. kind: 'radarr' (movies) or 'sonarr' (tv)."""
 
     def __init__(self, kind: str, base_url: str, api_key: str,
-                 profile_name: str = "", root_folder: str = ""):
+                 profile_name: str = "", root_folder: str = "",
+                 fallback_profile: str = "", fallback_before_year: int = 0):
         assert kind in ("radarr", "sonarr")
         self.kind = kind
         self.media_type = "movie" if kind == "radarr" else "tv"
@@ -25,8 +26,13 @@ class ArrClient:
         self.api_key = api_key
         self.profile_name = profile_name.strip()
         self.root_folder = root_folder.strip()
+        # Older titles rarely exist in 4K: anything released before `fallback_before_year` is added with
+        # the fallback profile instead (auto-detected 1080p profile when the main one is a 2160p profile).
+        self.fallback_profile = fallback_profile.strip()
+        self.fallback_before_year = int(fallback_before_year or 0)
         self._session: aiohttp.ClientSession | None = None
         self._profile_id: int | None = None
+        self._fallback_id: int | None = None
         self._root_path: str | None = None
 
     async def _sess(self) -> aiohttp.ClientSession:
@@ -109,6 +115,7 @@ class ArrClient:
             if chosen is None:
                 raise RuntimeError(f"{self.kind} has no quality profiles")
             self._profile_id = chosen["id"]
+            self._fallback_id = self._pick_fallback(profiles, chosen)
         if self._root_path is None:
             if self.root_folder:
                 self._root_path = self.root_folder
@@ -118,6 +125,43 @@ class ArrClient:
                     raise RuntimeError(f"{self.kind} has no root folders")
                 self._root_path = roots[0]["path"]
 
+    @staticmethod
+    def _is_uhd_profile(p: dict) -> bool:
+        name = (p.get("name") or "").lower()
+        if any(k in name for k in ("ultra", "2160", "4k", "uhd")):
+            return True
+        allowed = [i for i in p.get("items") or [] if i.get("allowed")]
+        quals = [(i.get("quality") or {}).get("name", "") for i in allowed] + \
+                [q.get("quality", {}).get("name", "") for i in allowed for q in i.get("items") or []]
+        quals = [q for q in quals if q]
+        return bool(quals) and all("2160" in q for q in quals)
+
+    def _pick_fallback(self, profiles: list[dict], chosen: dict) -> int | None:
+        if self.fallback_profile:
+            want = self.fallback_profile.lower()
+            m = next((p for p in profiles if (p.get("name") or "").lower() == want), None)
+            if m is None:
+                log.warning("%s: fallback profile %r not found — ignoring", self.kind, self.fallback_profile)
+            return m["id"] if m else None
+        if not self._is_uhd_profile(chosen):
+            return None
+        m = next((p for p in profiles if "1080" in (p.get("name") or "") and not self._is_uhd_profile(p)), None)
+        if m:
+            log.info("%s: %r is a 4K profile; titles before %s will use %r", self.kind, chosen.get("name"),
+                     self.fallback_before_year or "—", m.get("name"))
+        return m["id"] if m else None
+
+    def profile_for(self, raw: dict) -> int | None:
+        """Main profile, or the fallback for titles released before the cutoff year."""
+        year = raw.get("year") or 0
+        try:
+            year = int(year)
+        except (TypeError, ValueError):
+            year = 0
+        if self._fallback_id and self.fallback_before_year and 0 < year < self.fallback_before_year:
+            return self._fallback_id
+        return self._profile_id
+
     async def add(self, raw: dict) -> tuple[bool, str, int | None]:
         """Add + start searching. Returns (ok, message, arr_id)."""
         if raw.get("id"):
@@ -125,7 +169,7 @@ class ArrClient:
         await self._resolve_defaults()
         body = dict(raw)
         body.update({
-            "qualityProfileId": self._profile_id,
+            "qualityProfileId": self.profile_for(raw),
             "rootFolderPath": self._root_path,
             "monitored": True,
         })

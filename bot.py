@@ -66,6 +66,11 @@ SONARR_URL = os.environ.get("SONARR_URL", "").strip()
 SONARR_API_KEY = os.environ.get("SONARR_API_KEY", "").strip()
 SONARR_PROFILE = os.environ.get("SONARR_PROFILE", "").strip()
 SONARR_ROOT = os.environ.get("SONARR_ROOT", "").strip()
+# Titles released before this year are added with the *_FALLBACK_PROFILE (auto: a 1080p profile when the
+# main profile is 4K-only). 0 disables.
+FALLBACK_BEFORE_YEAR = int(os.environ.get("FALLBACK_BEFORE_YEAR", "2016") or 0)
+RADARR_FALLBACK_PROFILE = os.environ.get("RADARR_FALLBACK_PROFILE", "").strip()
+SONARR_FALLBACK_PROFILE = os.environ.get("SONARR_FALLBACK_PROFILE", "").strip()
 
 # Extra channels (name or ID; empty = feature off)
 STATUS_CHANNEL = os.environ.get("STATUS_CHANNEL", "").strip().lstrip("#")
@@ -81,10 +86,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("displexia")
 
 seerr = SeerrClient(OVERSEERR_URL, OVERSEERR_API_KEY) if OVERSEERR_URL and OVERSEERR_API_KEY else None
-radarr = ArrClient("radarr", RADARR_URL, RADARR_API_KEY, RADARR_PROFILE, RADARR_ROOT) \
-    if RADARR_URL and RADARR_API_KEY else None
-sonarr = ArrClient("sonarr", SONARR_URL, SONARR_API_KEY, SONARR_PROFILE, SONARR_ROOT) \
-    if SONARR_URL and SONARR_API_KEY else None
+radarr = ArrClient("radarr", RADARR_URL, RADARR_API_KEY, RADARR_PROFILE, RADARR_ROOT,
+                   RADARR_FALLBACK_PROFILE, FALLBACK_BEFORE_YEAR) if RADARR_URL and RADARR_API_KEY else None
+sonarr = ArrClient("sonarr", SONARR_URL, SONARR_API_KEY, SONARR_PROFILE, SONARR_ROOT,
+                   SONARR_FALLBACK_PROFILE, FALLBACK_BEFORE_YEAR) if SONARR_URL and SONARR_API_KEY else None
 
 
 def active_backend() -> str:

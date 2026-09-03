@@ -96,6 +96,8 @@ displexia restart    restart the bot
 | `SONARR_URL` / `SONARR_API_KEY` | Sonarr base URL (e.g. `http://192.168.1.13:8989`) + API key (Settings → General) |
 | `RADARR_PROFILE` / `SONARR_PROFILE` | Quality profile *name* to add with (empty = first profile) |
 | `RADARR_ROOT` / `SONARR_ROOT` | Root folder path override (empty = first root folder) |
+| `FALLBACK_BEFORE_YEAR` | Titles released before this year (default `2016`) are added with the fallback profile instead — old shows and films rarely exist in 4K, so a 4K-only profile would never grab anything. `0` disables |
+| `RADARR_FALLBACK_PROFILE` / `SONARR_FALLBACK_PROFILE` | Fallback profile *name* (empty = auto: your first 1080p profile, only when the main profile is 4K-only) |
 | `STATUS_CHANNEL` / `NEW_CHANNEL` | Live status board / new-arrivals channels, by name or ID (empty = off) |
 | `AUTO_REVOKE` | `1` = revoke the Plex share on leave/role loss (needs Server Members Intent) |
 | `MOVIES_CHANNEL` / `TV_CHANNEL` | Where announcement cards go, per type — channel name (`movies`, `tv`) or ID; empty = the requests channel |
